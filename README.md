@@ -1,5 +1,5 @@
 # Life Logger
-### ▶ [Try the system demo](https://sscopazzi.github.io/Life_Logger/docs/lifelogger-demo.html)
+### ▶ [Try the system demo](https://sscopazzi.github.io/Life_Logger/)
 The demo requires no hardware and no sign-up. It runs in your browser with auto-filled made-up data and any changes you make stay in that browser.
 
 ---
