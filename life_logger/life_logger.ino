@@ -20,8 +20,8 @@
               SELECT (upper right): pin 9 to GND, its LED ring + on A1 (pin 17); a press opens, ticks or starts what
                 is highlighted; a hold (1.5 s) turns the screen off
               hold BACK + turn the knob: screen brightness · hold BACK + SELECT 3 s: a third shortcut (find my phone, …)
+              their lights follow the screen's brightness; only the button used blinks; Settings can turn them off
           + I2C EEPROM breakout (24LC32 or larger, 0x50)             on/off record
-          + SHT30 on STEMMA QT (optional)                            shows up as node "Hub"
           + BMP388 pressure sensor (Adafruit 3966, STEMMA QT, 0x77)   BAROGRAPH, its own pressure track (/baro).
             It sits inside the box, so the case needs a small vent (a 1 mm hole away from the electronics, or a
             vent plug); its temperature is the inside of the box and is only ever shown as that
@@ -29,8 +29,9 @@
             alerts by sound, vibration or both (Settings)
           + USB power sense: the Feather's USB pin (5 V when plugged in) through 100k to A2 (pin 16), 100k from
             A2 to GND. Plugged in = on USB; no guessing from the battery voltage
-  Power switch: latching button (916) - common to GND, normally-closed contact to EN: button out = off.
-    Off = regulator off; the LiPo still charges on USB. (Terminal FeatherWing: leave its slide switch ON.)
+  Power switch: SS12F15 micro slide switch (SPDT, 3 pins) in the top side: middle pin to EN, one end pin to
+    GND, the other end pin unused. Slid toward the GND pin = off (EN held low, regulator off); the LiPo still
+    charges on USB. (Terminal FeatherWing: leave its own slide switch ON.)
   Partitions: partitions.csv in this folder (two 1.5 MB app slots for .lbk updates, 896 KB flash storage) is
   used whatever the menu says. In the Arduino IDE pick Tools > Partition Scheme > "Minimal SPIFFS (1.9MB APP
   with OTA)" only so its size check allows more than 1.25 MB; the real limit is 1,572,864 bytes.
@@ -56,8 +57,8 @@
     written to <name>.tmp and swapped in; start-up finishes or discards an interrupted swap.
 
   Low battery: below 3.30 V for 30 s and not on USB, the box finishes writing and switches itself off
-    (deep sleep with no wake source, STEMMA QT power off). It stays off until the power button is pressed
-    out and in again; charge it first.
+    (deep sleep with no wake source, STEMMA QT power off). It stays off until the power switch is slid
+    off and on again; charge it first.
 
   GPS: asleep (PMTK standby) while the box is on the home Wi-Fi, on elsewhere; the quick menu can set it
     on or off by hand until the box restarts. A work trip keeps it on. Sleeps and wakes go in the log.
@@ -89,7 +90,7 @@
 
   Clock: NTP on the house Wi-Fi, else GPS, else the PCF8523, else set from the phone/laptop.
 
-  Libraries: RTClib, Adafruit SHT31, Adafruit MAX1704X, Adafruit LC709203F, Adafruit BusIO,
+  Libraries: RTClib, Adafruit MAX1704X, Adafruit LC709203F, Adafruit BusIO,
              Adafruit SSD1327, Adafruit GFX, Adafruit seesaw, Adafruit BMP3XX, Adafruit Unified Sensor,
              Adafruit DRV2605, ArduinoJson (7.x).
   Core: esp32 by Espressif 3.x
@@ -110,7 +111,6 @@
 #include <SD.h>
 #include <Wire.h>
 #include <RTClib.h>
-#include <Adafruit_SHT31.h>
 #include <Adafruit_MAX1704X.h>
 #include <Adafruit_seesaw.h>
 #include <Adafruit_LC709203F.h>
@@ -140,7 +140,6 @@ const uint8_t  SD_CS          = 10;         // Adalogger FeatherWing SD chip sel
 const uint8_t  EE_ADDR        = 0x50;       // I2C EEPROM address
 const uint32_t ENV_LOG_S      = 300;        // climate log interval (s), aligned to the clock
 const uint8_t  ENV_FLASH_DAYS = 10;         // climate days kept in flash when there is no SD card
-const uint32_t HUB_SENSOR_S   = 30;         // hub's own SHT30 read interval (if fitted)
 const uint32_t OUTAGE_MIN_S   = 120;        // shorter off periods aren't logged (USB flashing, quick resets)
 const uint8_t  GPS_ADDR       = 0x10;       // PA1010D on I2C
 const uint32_t GPS_LOG_S      = 30;         // log a track point at most this often while moving...
@@ -150,7 +149,7 @@ const float    GPS_MAX_HDOP   = 5.0f;       // poorer fixes are not logged
 const uint32_t BATT_READ_S    = 30;
 // Low battery: below BATT_OFF_V for 30 s, and not charging, the box finishes what it is writing and switches
 // itself off (deep sleep with nothing set to wake it, the STEMMA QT parts unpowered). It stays off: charge it,
-// then press the power button out and in again. The LiPo's own protection cuts at 3.0 V, but the Feather's
+// then slide the power switch off and on again. The LiPo's own protection cuts at 3.0 V, but the Feather's
 // 3.3 V regulator sags well before that, so the box would brown out mid-write; below about 3.3 V a LiPo has
 // only a few percent left anyway.
 const float    BATT_OFF_V     = 3.30f;
@@ -212,11 +211,10 @@ typedef struct __attribute__((packed)) {
 
 WebServer server(80);
 RTC_PCF8523 rtc;
-Adafruit_SHT31 sht;
 Adafruit_MAX17048 gaugeMax;
 Adafruit_LC709203F gaugeLc;
 
-bool rtcOK = false, hubSht = false;
+bool rtcOK = false;
 bool timeValid = false;
 struct Sess { String h; uint32_t exp; bool keep; };   // a login: hash of its token; keep: exp in epoch s (0 = no end), else millis
 const char* timeSrc = "none";
@@ -251,7 +249,6 @@ struct LogPass { uint32_t good, bad, maxSeq, bytes; bool torn; };   // one pass 
 uint32_t lastSdRetry = 0;
 uint32_t lastEnvSlot = 0;
 String   lastPruneDay = "";
-uint32_t lastHubRead = 0;
 uint32_t docVer = 0;                       // bumps on every document write; the dashboard watches it
 bool otaAuthorized = false;
 // .lbk bundle: "LOGBOOK1 {...,"ui":N,"bin":M}\n" + N bytes of gzipped dashboard + M bytes of firmware
@@ -320,14 +317,14 @@ portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
 //  Settings kept on the box (first-boot setup / Settings > Network). Nothing personal is compiled in: the starting
 //  hotspot is public, and there is no default home Wi-Fi and no default box password.
 // ======================================================================
-struct Cfg { String apSsid, apPass, homeSsid, homePass, tz, passSalt, passHash; bool setupDone; int contrast; bool bnwasOn; int bnwasMin; int scrOffMin; bool clHideDone; uint8_t alert; } cfg;   // alert: 0 sound, 1 vibrate, 2 both
+struct Cfg { String apSsid, apPass, homeSsid, homePass, tz, passSalt, passHash; bool setupDone; int contrast; bool bnwasOn; int bnwasMin; int scrOffMin; bool clHideDone; uint8_t alert; bool btnLed; } cfg;   // alert: 0 sound, 1 vibrate, 2 both; btnLed: the button lights on
 const char* CFG_PATH = "/hwo/config.json";
 volatile bool cfgApplyAp = false, cfgApplySta = false;
 uint32_t cfgApplyAt = 0;
 
 void cfgDefaults() {
   cfg.apSsid = HUB_AP_SSID; cfg.apPass = HUB_AP_PASS; cfg.homeSsid = ""; cfg.homePass = ""; cfg.passSalt = ""; cfg.passHash = "";
-  cfg.tz = TZ_POSIX; cfg.setupDone = false; cfg.contrast = 0x7F; cfg.bnwasOn = false; cfg.bnwasMin = 30; cfg.scrOffMin = 5; cfg.clHideDone = false; cfg.alert = 2;
+  cfg.tz = TZ_POSIX; cfg.setupDone = false; cfg.contrast = 0x7F; cfg.bnwasOn = false; cfg.bnwasMin = 30; cfg.scrOffMin = 5; cfg.clHideDone = false; cfg.alert = 2; cfg.btnLed = true;
 }
 void cfgLoad() {
   cfgDefaults();
@@ -342,12 +339,13 @@ void cfgLoad() {
   cfg.scrOffMin = constrain((int)(d["scrOffMin"] | 5), 0, 240);   // 0 = never sleeps
   cfg.clHideDone = d["clHideDone"] | false;
   cfg.alert = constrain((int)(d["alert"] | 2), 0, 2);
+  cfg.btnLed = d["btnLed"] | true;
   cfg.passSalt = d["passSalt"] | ""; cfg.passHash = d["passHash"] | "";
 }
 bool cfgSave() {
   JsonDocument d;
   d["apSsid"] = cfg.apSsid; d["apPass"] = cfg.apPass; d["homeSsid"] = cfg.homeSsid; d["homePass"] = cfg.homePass;
-  d["tz"] = cfg.tz; d["setupDone"] = cfg.setupDone; d["contrast"] = cfg.contrast; d["bnwasOn"] = cfg.bnwasOn; d["bnwasMin"] = cfg.bnwasMin; d["scrOffMin"] = cfg.scrOffMin; d["clHideDone"] = cfg.clHideDone; d["alert"] = cfg.alert;
+  d["tz"] = cfg.tz; d["setupDone"] = cfg.setupDone; d["contrast"] = cfg.contrast; d["bnwasOn"] = cfg.bnwasOn; d["bnwasMin"] = cfg.bnwasMin; d["scrOffMin"] = cfg.scrOffMin; d["clHideDone"] = cfg.clHideDone; d["alert"] = cfg.alert; d["btnLed"] = cfg.btnLed;
   d["passSalt"] = cfg.passSalt; d["passHash"] = cfg.passHash;
   String out; serializeJson(d, out);
   String tmp = String(CFG_PATH) + ".tmp";
@@ -713,6 +711,7 @@ void ensureDirs(fs::FS& fs) {
   if (!fs.exists("/hwo/nt")) fs.mkdir("/hwo/nt");
   if (!fs.exists("/hwo/na")) fs.mkdir("/hwo/na");
   if (!fs.exists("/hwo/nh")) fs.mkdir("/hwo/nh");
+  if (!fs.exists("/hwo/pl")) fs.mkdir("/hwo/pl");
   if (!fs.exists("/gps")) fs.mkdir("/gps");
   if (!fs.exists("/baro")) fs.mkdir("/baro");
 }
@@ -1204,16 +1203,6 @@ void envLogTick() {
   f.close();
 }
 
-void hubSensorTick() {
-  if (!hubSht || millis() - lastHubRead < HUB_SENSOR_S * 1000UL) return;
-  lastHubRead = millis();
-  float t = NAN, h = NAN;
-  bool ok = sht.readBoth(&t, &h);
-  uint8_t mac[6]; WiFi.macAddress(mac);
-  static uint32_t s = 0;
-  updateNode("Hub", mac, t, h, NAN, NAN, 0, ++s, HUB_SENSOR_S, ok ? 1 : 0);
-}
-
 // ======================================================================
 //  Pressure (BMP388 inside the box): read every minute, the 10-minute average saved to its own track,
 //  /baro/YYYY-MM-DD.csv (a calendar day in the box's time zone): utc,hpa,box_c,n  (utc: the start of the
@@ -1683,8 +1672,10 @@ void wifiTick() {
 //            start the picked job or pinned project; MAP: tick Work trip, or save a spot
 //    turning while it's held is a turn, not a press; hold 1.5 s = screen off
 //  Button (lit): press = back (an open note, work order or event to its list, then LIFE LOGGER). On LIFE
-//    LOGGER, hold it and turn the knob to set the brightness (kept on the box). Its light is full while the
-//    screen is on and glows dim while asleep.
+//    LOGGER, hold it and turn the knob to set the brightness (kept on the box).
+//  Button lights: as bright as the screen, dim while it sleeps. When something is done (a tick, a start, a
+//    saved spot) only the button that did it blinks; both flash for an alarm. Settings > The box can turn
+//    them off altogether (alarms then only sound or vibrate).
 //  The screen goes to sleep after cfg.scrOffMin minutes with nothing touched (0 = never; set from the
 //  dashboard). When it is asleep, the first turn or press only wakes it. Alarms wake it.
 //  Without the encoder: button press = next screen, hold = what a knob press does; the screen still
@@ -1743,6 +1734,8 @@ struct EncSw { bool down, longDone, swallow, turned, woke; uint32_t t0; } encSw 
 uint32_t lastInputMs = 0;   // last turn or press, for the sleep timer
 uint8_t scr = S_STATUS;
 uint32_t lastDrawMs = 0, msgUntil = 0, ledBlinkUntil = 0, lastEncMs = 0;
+uint8_t inputSrc = 0, ledBlinkMask = 0;                    // the button being handled: 1 BACK, 2 SELECT, 3 both, 0 the knob or the dashboard
+void ledBlink(uint32_t ms) { ledBlinkUntil = millis() + ms; ledBlinkMask = inputSrc; }   // blinks only the button that did it
 String msg;
 int sel = 0;
 int selMem[S_COUNT] = { 0 };
@@ -1959,7 +1952,7 @@ void jobPress(int s) {
   }
   if (!evs.length()) return;
   String ts; uint32_t first;
-  if (appendEvents(evs, ts, first) > 0) { msg = o.a == 'P' ? "Paused" : o.a == 'S' ? "Stopped" : "Started"; ledBlinkUntil = millis() + 400; }
+  if (appendEvents(evs, ts, first) > 0) { msg = o.a == 'P' ? "Paused" : o.a == 'S' ? "Stopped" : "Started"; ledBlink(400); }
   else msg = "Not saved";
   msgUntil = millis() + 1000; redraw = true;
 }
@@ -2035,7 +2028,7 @@ void tripEnd(bool atLastMove) {                           // atLastMove: ended f
                 ",\"t2\":" + jStr(isoLocal(t2)) + ",\"mi\":" + String(round(WT.m / 1609.344 * 10) / 10, 1) + ",\"gps\":true,\"src\":\"box\",\"biz\":true" +
                 ",\"lat1\":" + String(WT.lat1, 6) + ",\"lon1\":" + String(WT.lon1, 6) + ",\"lat2\":" + String(WT.pla, 6) + ",\"lon2\":" + String(WT.plo, 6) + "}";
     String ts; uint32_t first;
-    if (store && appendEvents(ev, ts, first) == 1) { msg = "Work trip saved"; ledBlinkUntil = millis() + 400; }
+    if (store && appendEvents(ev, ts, first) == 1) { msg = "Work trip saved"; ledBlink(400); }
     else { msg = "Trip not saved"; msgUntil = millis() + 1500; redraw = true; return; }   // stays on, to try again
   }
   WT.on = false; tripSave();
@@ -2151,7 +2144,7 @@ void clToggle(int row) {
   if (!ok) { msg = "Not saved"; msgUntil = millis() + 2000; return; }
   docVer++;
   if (evs.length() && timeValid && store) { String ts; uint32_t first; appendEvents(evs, ts, first); }
-  ledBlinkUntil = millis() + 400;                         // the light blinks; the row itself shows the tick
+  ledBlink(400);                         // the light blinks; the row itself shows the tick
   clSelId = id0;
   clLoad();
 }
@@ -3108,7 +3101,7 @@ void shortcut(const String& k) {
   else if (k == "mark") spotSave();
   else if (k == "trip") { if (WT.on) tripEnd(false); else tripStart(); }
   else if (k == "off") screenPower(false);
-  else if (k == "phone") { findPhoneEp = time(nullptr); msg = "Calling phones"; msgUntil = millis() + 2000; ledBlinkUntil = millis() + 1200; }
+  else if (k == "phone") { findPhoneEp = time(nullptr); msg = "Calling phones"; msgUntil = millis() + 2000; ledBlink(1200); }
   else if (k == "beep") { beepOnce(); msg = alertSound() && alertVibe() ? "Sound + vibrate" : alertVibe() ? "Vibrate" : "Sound"; msgUntil = millis() + 1200; }
   else if (k == "restart") { msg = "Restarting"; msgUntil = millis() + 2000; redraw = true; drawScreen(); delay(600); ESP.restart(); }
   redraw = true;
@@ -3129,7 +3122,7 @@ void spotSave() {
   String ev = "{\"op\":\"spot.add\",\"id\":\"sp-" + String(t, HEX) + String(millis() % 1000) + "\",\"lat\":" + String(gps.lat, 6) + ",\"lon\":" + String(gps.lon, 6) +
               ",\"t\":" + jStr(isoLocal(t)) + ",\"src\":\"box\"}";
   String ts; uint32_t first;
-  if (appendEvents(ev, ts, first) == 1) { spotsToday++; msg = "Spot saved"; ledBlinkUntil = millis() + 400; }
+  if (appendEvents(ev, ts, first) == 1) { spotsToday++; msg = "Spot saved"; ledBlink(400); }
   else msg = "Not saved";
   msgUntil = millis() + 1500; redraw = true;
 }
@@ -3224,11 +3217,11 @@ void screenTick() {
     else {
       if (btn.swallow) btn.swallow = false;
       else if (bright) { bright = false; cfgSave(); msg = "Saved"; msgUntil = now + 800; redraw = true; }
-      else if (!btn.held && !btn.paired && !bothDone) onShort();
+      else if (!btn.held && !btn.paired && !bothDone) { inputSrc = 1; onShort(); inputSrc = 0; }
       if (!btn2.down) bothDone = false;
     }
   }
-  if (btn.down && !btn.held && !btn.swallow && !btn2.down && now - btn.t0 >= HOLD_MS) { btn.held = true; onHold(); }
+  if (btn.down && !btn.held && !btn.swallow && !btn2.down && now - btn.t0 >= HOLD_MS) { btn.held = true; inputSrc = 1; onHold(); inputSrc = 0; }
   // SELECT: a press opens, ticks or starts what is highlighted (or runs the quick menu's row); a hold turns the screen off
   bool raw2 = digitalRead(btn2.pin) == LOW;
   if (raw2 != btn2.raw) { btn2.raw = raw2; btn2.chg = now; }
@@ -3237,7 +3230,7 @@ void screenTick() {
     if (raw2) { btn2.t0 = now; btn2.held = false; btn2.paired = btn.down; if (btn.down) btn.paired = true; btn2.swallow = touched(now); }
     else {
       if (btn2.swallow) {}
-      else if (!btn2.held && !btn2.paired && !bothDone && screenOn) { if (qmOn) qmRun(); else press(); }
+      else if (!btn2.held && !btn2.paired && !bothDone && screenOn) { inputSrc = 2; if (qmOn) qmRun(); else press(); inputSrc = 0; }
       btn2.swallow = false;
       if (!btn.down) bothDone = false;
     }
@@ -3245,16 +3238,18 @@ void screenTick() {
   if (btn2.down && !btn2.held && !btn2.swallow && !btn.down && now - btn2.t0 >= SEL_OFF_MS) { btn2.held = true; qmOn = false; screenPower(false); }
   if (qmOn && btn.down && !btn.paired) { qmOn = false; btn.paired = true; redraw = true; }   // BACK while the menu is open: close it, run nothing else
   // both held: the third shortcut, once
-  if (btn.down && btn2.down && !bothDone && now - max(btn.t0, btn2.t0) >= BOTH_MS) { bothDone = true; btn.held = btn2.held = true; btn.swallow = btn2.swallow = false; shortcut(btnB); }
+  if (btn.down && btn2.down && !bothDone && now - max(btn.t0, btn2.t0) >= BOTH_MS) { bothDone = true; btn.held = btn2.held = true; btn.swallow = btn2.swallow = false; inputSrc = 3; shortcut(btnB); inputSrc = 0; }
   encTick(now);
   // alarms wake the screen; otherwise it sleeps after cfg.scrOffMin minutes untouched
   if (alarmActive() || tripBeeping()) { if (!screenOn) screenPower(true); lastInputMs = now; }
   else if (screenOn && cfg.scrOffMin > 0 && now - lastInputMs > (uint32_t)cfg.scrOffMin * 60000UL) screenPower(false);
-  // button light: full with the screen on, dim while it sleeps; blinks on a tick; flashes during an alarm
-  uint8_t led = screenOn ? 255 : (oledOK ? LED_DIM : 0);
-  if (alarmActive() || tripBeeping()) led = (now / (bnStage == 1 ? 500 : 150)) % 2 ? 255 : 0;
-  else if (now < ledBlinkUntil) led = (now / 100) % 2 ? 255 : 0;
-  ledcWrite(BTN_LED, led); ledcWrite(BTN2_LED, led);
+  // button lights: the screen's brightness while it is on, dim while it sleeps, off if Settings says so;
+  // only the button that did something blinks; both flash during an alarm
+  uint8_t full = cfg.btnLed ? (uint8_t)constrain(cfg.contrast, 1, 255) : 0;
+  uint8_t base = screenOn ? full : (oledOK ? min(full, LED_DIM) : 0), l1 = base, l2 = base;
+  if (alarmActive() || tripBeeping()) l1 = l2 = (now / (bnStage == 1 ? 500 : 150)) % 2 ? full : 0;
+  else if (now < ledBlinkUntil) { uint8_t b = (now / 100) % 2 ? full : 0; if (ledBlinkMask & 1) l1 = b; if (ledBlinkMask & 2) l2 = b; }
+  ledcWrite(BTN_LED, l1); ledcWrite(BTN2_LED, l2);
   if (!screenOn) return;
   if (redraw || now - lastDrawMs > (alarmActive() ? 250u : mqOn ? 30u : 1000u)) { drawScreen(); lastDrawMs = now; redraw = false; }
 }
@@ -3311,6 +3306,9 @@ void handleTimersPost() {
       if (m != cfg.scrOffMin) { cfg.scrOffMin = m; if (flashOK && !cfgSave()) { sendErr(503, "Could not save"); return; } }
     }
     if (d["on"].is<bool>()) { lastInputMs = now; screenPower(d["on"].as<bool>()); }
+    if (d["btnLed"].is<bool>() && d["btnLed"].as<bool>() != cfg.btnLed) {
+      cfg.btnLed = d["btnLed"].as<bool>(); if (flashOK && !cfgSave()) { sendErr(503, "Could not save"); return; }
+    }
     if (d["clHide"].is<bool>() && d["clHide"].as<bool>() != cfg.clHideDone) {
       cfg.clHideDone = d["clHide"].as<bool>(); clVer = 0xFFFFFFFF;            // re-read the list
       if (flashOK && !cfgSave()) { sendErr(503, "Could not save"); return; }
@@ -3529,7 +3527,7 @@ void handleStatus() {
     s += ",\"baro\":{\"ok\":" + jBool(bmpOK); kv(s, "hpa", jNum(baroHpa, 2)); kv(s, "d3", jNum(d3, 2)); kvS(s, "word", isnan(d3) ? String("") : baroWord(d3));
     kv(s, "boxC", jNum(baroC, 1)); kvU(s, "saveS", BARO_SAVE_S); if (l) kvU(s, "lastEp", l * BARO_SAVE_S); s += "}"; }
   if (lastFix.ep) { s += ",\"lastFix\":{\"lat\":" + String(lastFix.lat, 5); kv(s, "lon", String(lastFix.lon, 5)); kvU(s, "ep", lastFix.ep); s += "}"; }
-  s += ",\"screen\":{\"ok\":" + jBool(oledOK); kvB(s, "on", screenOn); kvB(s, "enc", encOK); kvU(s, "encAddr", encAddr); kvU(s, "offMin", cfg.scrOffMin); kvB(s, "clHide", cfg.clHideDone); s += "}";
+  s += ",\"screen\":{\"ok\":" + jBool(oledOK); kvB(s, "on", screenOn); kvB(s, "enc", encOK); kvU(s, "encAddr", encAddr); kvU(s, "offMin", cfg.scrOffMin); kvB(s, "clHide", cfg.clHideDone); kvB(s, "btnLed", cfg.btnLed); kvU(s, "bright", cfg.contrast); s += "}";
   kvB(s, "gpsBus", gpsI2C);
   s += ",\"nodes\":[";
   bool first = true;
@@ -3741,15 +3739,21 @@ bool validNoteName(const String& n) {   // notes nt/0 …, archived notes na/1 �
   for (size_t i = 3; i < n.length(); i++) if (!isdigit((unsigned char)n[i])) return false;
   return true;
 }
+bool validPlanName(const String& n) {     // archived Planner plans: pl/<1-24 of A-Z a-z 0-9 ->
+  if (!n.startsWith("pl/") || n.length() < 4 || n.length() > 27) return false;
+  for (size_t i = 3; i < n.length(); i++) if (!isalnum((unsigned char)n[i]) && n[i] != '-') return false;
+  return true;
+}
 bool validDocName(const String& n) {
-  if (n == "checklist" || n == "oled") return true;
+  if (n == "checklist" || n == "oled" || n == "plan") return true;
+  if (validPlanName(n)) return true;
   if (validIcsName(n) || validCxName(n) || validNoteName(n)) return true;
   if (!n.startsWith("cl/") || n.length() < 13 || n.length() > 17) return false;
   for (size_t i = 3; i < n.length(); i++) if (!isdigit((unsigned char)n[i]) && n[i] != '-') return false;
   return true;
 }
-String docPath(const String& n) { return n == "checklist" ? String("/hwo/doc/checklist.json") : n == "oled" ? String("/hwo/doc/oled.json") : "/hwo/" + n + ".json"; }  // cl/<day>, cx/<month>, ics/<id>, nt/<k>, na/<k>
-bool flashFirst(const String& n) { return n == "checklist" || n == "oled" || n.startsWith("nt/"); }   // kept in flash, copied to the card
+String docPath(const String& n) { return n == "checklist" || n == "oled" || n == "plan" ? "/hwo/doc/" + n + ".json" : "/hwo/" + n + ".json"; }  // cl/<day>, cx/<month>, ics/<id>, nt/<k>, na/<k>, pl/<id>
+bool flashFirst(const String& n) { return n == "checklist" || n == "oled" || n == "plan" || n.startsWith("nt/"); }   // kept in flash, copied to the card
 
 void handleDocGet() {
   String n = server.arg("n");
@@ -3784,7 +3788,7 @@ void handleDocPut() {
   if (validIcsName(n)) { sendErr(400, "Calendars go to /api/doc-up"); return; }
   String p = docPath(n);
   bool ok = false;
-  if (n == "checklist" || n == "oled") {
+  if (n == "checklist" || n == "oled" || n == "plan") {      // plan: the Planner's current plan
     if (flashOK) { ensureDirs(LittleFS); ok = writeDoc(LittleFS, p, body); if (ok && sdOK) { ensureDirs(SD); writeDoc(SD, p, body); } }
     else if (sdOK) { ensureDirs(SD); ok = writeDoc(SD, p, body); }
   } else if (n.startsWith("nt/")) {      // notes: flash plus a copy on the card; card only once flash is nearly full
@@ -3823,7 +3827,7 @@ void handleDocList() {
   String s = "[";
   bool first = true;
   String d = server.arg("d");
-  const char* dir = d == "ics" ? "ics" : d == "cx" ? "cx" : d == "nt" ? "nt" : d == "na" ? "na" : d == "nh" ? "nh" : "cl";
+  const char* dir = d == "ics" ? "ics" : d == "cx" ? "cx" : d == "nt" ? "nt" : d == "na" ? "na" : d == "nh" ? "nh" : d == "pl" ? "pl" : "cl";
   if (sdOK) listDocs(SD, s, first, dir);
   if (flashOK) listDocs(LittleFS, s, first, dir);
   s += "]";
@@ -3864,7 +3868,7 @@ void handleDocUpload() {
 
 void handleDocDel() {
   String n = server.arg("n");
-  if (!validIcsName(n) && !validCxName(n) && !validNoteName(n) && !(n.startsWith("cl/") && validDocName(n))) { sendErr(400, "Only imported calendars, archived checklist days, their index and note files can be removed"); return; }
+  if (!validIcsName(n) && !validCxName(n) && !validNoteName(n) && !validPlanName(n) && n != "plan" && !(n.startsWith("cl/") && validDocName(n))) { sendErr(400, "Only imported calendars, archived checklist days, their index, note files and Planner plans can be removed"); return; }
   String p = docPath(n);
   bool a = sdOK && SD.exists(p) && SD.remove(p);
   bool b = flashOK && LittleFS.exists(p) && LittleFS.remove(p);
@@ -4271,7 +4275,7 @@ void lowShow(const char* l1, const char* l2, const char* l3, const char* l4, uin
 void lowBattOff() {
   Serial.printf("Battery %.2f V: switching off\n", battV);
   heartbeatNow(true);                                      // the off time is measured from now, and History will say why
-  lowShow("BATTERY LOW", "Switched off.", "Charge it, then", "press power off & on", 6000);
+  lowShow("BATTERY LOW", "Switched off.", "Charge it, then", "slide power off & on", 6000);
   ledcWrite(BTN_LED, 0); ledcWrite(BTN2_LED, 0); buzSet(0); hapSet(false);
   WiFi.mode(WIFI_OFF);
   if (sdOK) SD.end();                                      // every write is already closed; this just lets go of the card
@@ -4281,7 +4285,7 @@ void lowBattOff() {
 #endif
   Serial.flush();
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
-  esp_deep_sleep_start();                                  // nothing wakes it: only the power button (EN) restarts it
+  esp_deep_sleep_start();                                  // nothing wakes it: only the power switch (EN) restarts it
 }
 void setup() {
   Serial.begin(115200);
@@ -4302,7 +4306,6 @@ void setup() {
     }
     rtc.start();
   }
-  hubSht = sht.begin(0x44);
   baroStart();
   hapStart();
   if (USB_PIN >= 0) { pinMode(USB_PIN, INPUT); analogSetPinAttenuation(USB_PIN, ADC_11db); }
@@ -4323,9 +4326,9 @@ void setup() {
 
   Serial.printf("Screen %s  GPS %s\n", oledOK ? "ok" : "none", gpsI2C ? "ok" : "none");
   Serial.printf("BMP388 %s  vibration motor %s  USB sense %s\n", bmpOK ? "ok" : "none", hapOK ? "ok" : "none", USB_PIN >= 0 ? "A2" : "off");
-  Serial.printf("Flash %s  SD %s  RTC %s  EEPROM %s  SHT30 %s  battery gauge %s   log: %s, %lu events\n",
+  Serial.printf("Flash %s  SD %s  RTC %s  EEPROM %s  battery gauge %s   log: %s, %lu events\n",
                 flashOK ? "ok" : "FAILED (partition scheme?)", sdOK ? "ok" : "none", rtcOK ? "ok" : "none",
-                eeOK ? "ok" : "none", hubSht ? "yes" : "no", battType == 1 ? "MAX17048" : battType == 2 ? "LC709203F" : "none",
+                eeOK ? "ok" : "none", battType == 1 ? "MAX17048" : battType == 2 ? "LC709203F" : "none",
                 storeName, (unsigned long)(logNextSeq - 1));
   if (eeOK && lastAlive) Serial.printf("Last heartbeat: %lu (epoch)\n", (unsigned long)lastAlive);
 
@@ -4356,7 +4359,6 @@ void loop() {
 
   outageCheck();
   heartbeatTick();
-  hubSensorTick();
   baroTick();
   envLogTick();
   wifiTick();
