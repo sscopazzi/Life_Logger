@@ -11,15 +11,24 @@
           + Mini GPS PA1010D (Adafruit 4415) on I2C, 0x10           track + clock away from home
           + 1.5" 128x128 grayscale OLED (4741, SSD1327, STEMMA QT, I2C 0x3D)   home menu, checklist, today, notes, work orders, job timer, expiring, map, cards, join
           + piezo (1739) between pins 5 and 6                        timers, find-my-box, BNWAS
-          + knob: I2C rotary encoder with push switch (5880, seesaw), STEMMA QT, 0x37 (A0 jumper closed)
+          + knob: I2C rotary encoder with push switch (5880, seesaw), STEMMA QT, 0x37 (A0 jumper closed).
+            Turn: move. Its push is ACTION: a press runs a shortcut set on the dashboard, a hold opens the
+            quick menu (it stays open: turn to a row, press to run it, BACK to close)
             optional: its INT pad to pin 12 (set ENC_INT_PIN) so the box only reads it when it moves
           + two lit buttons on the lid, left of the screen (558 each); the knob comes out of the right-hand side:
               BACK (lower left): pin 11 to GND, its LED ring + on A0 (pin 18)
-              ACTION (upper right): pin 9 to GND, its LED ring + on A1 (pin 17); a press runs a shortcut, a hold opens
-                the quick menu (turn the knob, let go to run the row); both set on the dashboard
-              hold BACK + turn the knob: screen brightness · hold both 3 s: a third shortcut (find my phone, …)
+              SELECT (upper right): pin 9 to GND, its LED ring + on A1 (pin 17); a press opens, ticks or starts what
+                is highlighted; a hold (1.5 s) turns the screen off
+              hold BACK + turn the knob: screen brightness · hold BACK + SELECT 3 s: a third shortcut (find my phone, …)
           + I2C EEPROM breakout (24LC32 or larger, 0x50)             on/off record
           + SHT30 on STEMMA QT (optional)                            shows up as node "Hub"
+          + BMP388 pressure sensor (Adafruit 3966, STEMMA QT, 0x77)   BAROGRAPH, its own pressure track (/baro).
+            It sits inside the box, so the case needs a small vent (a 1 mm hole away from the electronics, or a
+            vent plug); its temperature is the inside of the box and is only ever shown as that
+          + haptic driver DRV2605L (Adafruit 2305, STEMMA QT, 0x5A) + Vibrating Mini Motor Disc (Adafruit 1201)
+            alerts by sound, vibration or both (Settings)
+          + USB power sense: the Feather's USB pin (5 V when plugged in) through 100k to A2 (pin 16), 100k from
+            A2 to GND. Plugged in = on USB; no guessing from the battery voltage
   Power switch: latching button (916) - common to GND, normally-closed contact to EN: button out = off.
     Off = regulator off; the LiPo still charges on USB. (Terminal FeatherWing: leave its slide switch ON.)
   Partitions: partitions.csv in this folder (two 1.5 MB app slots for .lbk updates, 896 KB flash storage) is
@@ -46,12 +55,22 @@
     copies differ, the one with more good lines wins. Rewritten files (settings, checklist, notes) are
     written to <name>.tmp and swapped in; start-up finishes or discards an interrupted swap.
 
-  Low battery: below 3.30 V for 30 s and not charging, the box finishes writing and switches itself off
+  Low battery: below 3.30 V for 30 s and not on USB, the box finishes writing and switches itself off
     (deep sleep with no wake source, STEMMA QT power off). It stays off until the power button is pressed
     out and in again; charge it first.
 
   GPS: asleep (PMTK standby) while the box is on the home Wi-Fi, on elsewhere; the quick menu can set it
     on or off by hand until the box restarts. A work trip keeps it on. Sleeps and wakes go in the log.
+    The last fix is kept in flash (/hwo/fix.json), so SUN & MOON works from it while the GPS sleeps or has no fix.
+
+  SUN & MOON: sunrise, sunset, daylight, civil and nautical twilight, solar noon and how high the sun gets,
+    the moon's phase, how much is lit, its rise and set and the next full or new moon, worked out on the box
+    (astro.h) from the GPS fix, or the last fix it had (the screen says which). No fix ever: no times.
+
+  BAROGRAPH: the BMP388 is read every minute; every 10 minutes the average is saved to /baro/YYYY-MM-DD.csv
+    (utc,hpa,box_c,n). The screen shows the pressure, the change over the last 3 hours with its marine word
+    (steady, rising slowly, ... falling very rapidly) and a graph; turn the knob for 24 h, 48 h or 7 days.
+    Times the box was off stay empty on the graph.
 
   Dashboard: kept in flash as /www/index.html.gz, not in the firmware. Updates are one .lbk file
     (dashboard + firmware) uploaded from Settings > Firmware, or from the page the box shows when it has
@@ -71,7 +90,8 @@
   Clock: NTP on the house Wi-Fi, else GPS, else the PCF8523, else set from the phone/laptop.
 
   Libraries: RTClib, Adafruit SHT31, Adafruit MAX1704X, Adafruit LC709203F, Adafruit BusIO,
-             Adafruit SSD1327, Adafruit GFX, Adafruit seesaw, ArduinoJson (7.x).
+             Adafruit SSD1327, Adafruit GFX, Adafruit seesaw, Adafruit BMP3XX, Adafruit Unified Sensor,
+             Adafruit DRV2605, ArduinoJson (7.x).
   Core: esp32 by Espressif 3.x
 */
 
@@ -96,6 +116,8 @@
 #include <Adafruit_LC709203F.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1327.h>
+#include <Adafruit_BMP3XX.h>
+#include <Adafruit_DRV2605.h>
 #include <ArduinoJson.h>
 #include <vector>
 #include <algorithm>
@@ -103,6 +125,7 @@
 #include <sys/time.h>
 #include <mbedtls/sha256.h>
 #include <esp_sleep.h>
+#include "astro.h"
 #define HUB_AP_SSID "Life Logger"         // the starting hotspot, the same on every new box
 #define HUB_AP_PASS "lifelogger-setup"   // shown on the box's JOIN screen; first-boot setup makes you choose your own
 
@@ -131,6 +154,11 @@ const uint32_t BATT_READ_S    = 30;
 // 3.3 V regulator sags well before that, so the box would brown out mid-write; below about 3.3 V a LiPo has
 // only a few percent left anyway.
 const float    BATT_OFF_V     = 3.30f;
+const int8_t   USB_PIN        = 16;         // A2: the Feather's USB pin through a 100k/100k divider (2.5 V plugged in).
+                                            // -1 if it isn't wired: then being on USB is guessed from the battery voltage rising
+const uint16_t USB_MV         = 1500;       // above this at the pin = plugged in
+const uint32_t BARO_READ_S    = 60;         // BMP388 read
+const uint32_t BARO_SAVE_S    = 600;        // one saved pressure (the average) per 10 minutes, aligned to the clock
 // =========================================================
 
 // ---------- ESP-NOW packets: keep identical in life_logger_node ----------
@@ -292,14 +320,14 @@ portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
 //  Settings kept on the box (first-boot setup / Settings > Network). Nothing personal is compiled in: the starting
 //  hotspot is public, and there is no default home Wi-Fi and no default box password.
 // ======================================================================
-struct Cfg { String apSsid, apPass, homeSsid, homePass, tz, passSalt, passHash; bool setupDone; int contrast; bool bnwasOn; int bnwasMin; int scrOffMin; bool clHideDone; } cfg;
+struct Cfg { String apSsid, apPass, homeSsid, homePass, tz, passSalt, passHash; bool setupDone; int contrast; bool bnwasOn; int bnwasMin; int scrOffMin; bool clHideDone; uint8_t alert; } cfg;   // alert: 0 sound, 1 vibrate, 2 both
 const char* CFG_PATH = "/hwo/config.json";
 volatile bool cfgApplyAp = false, cfgApplySta = false;
 uint32_t cfgApplyAt = 0;
 
 void cfgDefaults() {
   cfg.apSsid = HUB_AP_SSID; cfg.apPass = HUB_AP_PASS; cfg.homeSsid = ""; cfg.homePass = ""; cfg.passSalt = ""; cfg.passHash = "";
-  cfg.tz = TZ_POSIX; cfg.setupDone = false; cfg.contrast = 0x7F; cfg.bnwasOn = false; cfg.bnwasMin = 30; cfg.scrOffMin = 5; cfg.clHideDone = false;
+  cfg.tz = TZ_POSIX; cfg.setupDone = false; cfg.contrast = 0x7F; cfg.bnwasOn = false; cfg.bnwasMin = 30; cfg.scrOffMin = 5; cfg.clHideDone = false; cfg.alert = 2;
 }
 void cfgLoad() {
   cfgDefaults();
@@ -313,12 +341,13 @@ void cfgLoad() {
   cfg.bnwasOn = d["bnwasOn"] | false; cfg.bnwasMin = constrain((int)(d["bnwasMin"] | 30), 1, 240);
   cfg.scrOffMin = constrain((int)(d["scrOffMin"] | 5), 0, 240);   // 0 = never sleeps
   cfg.clHideDone = d["clHideDone"] | false;
+  cfg.alert = constrain((int)(d["alert"] | 2), 0, 2);
   cfg.passSalt = d["passSalt"] | ""; cfg.passHash = d["passHash"] | "";
 }
 bool cfgSave() {
   JsonDocument d;
   d["apSsid"] = cfg.apSsid; d["apPass"] = cfg.apPass; d["homeSsid"] = cfg.homeSsid; d["homePass"] = cfg.homePass;
-  d["tz"] = cfg.tz; d["setupDone"] = cfg.setupDone; d["contrast"] = cfg.contrast; d["bnwasOn"] = cfg.bnwasOn; d["bnwasMin"] = cfg.bnwasMin; d["scrOffMin"] = cfg.scrOffMin; d["clHideDone"] = cfg.clHideDone;
+  d["tz"] = cfg.tz; d["setupDone"] = cfg.setupDone; d["contrast"] = cfg.contrast; d["bnwasOn"] = cfg.bnwasOn; d["bnwasMin"] = cfg.bnwasMin; d["scrOffMin"] = cfg.scrOffMin; d["clHideDone"] = cfg.clHideDone; d["alert"] = cfg.alert;
   d["passSalt"] = cfg.passSalt; d["passHash"] = cfg.passHash;
   String out; serializeJson(d, out);
   String tmp = String(CFG_PATH) + ".tmp";
@@ -685,6 +714,7 @@ void ensureDirs(fs::FS& fs) {
   if (!fs.exists("/hwo/na")) fs.mkdir("/hwo/na");
   if (!fs.exists("/hwo/nh")) fs.mkdir("/hwo/nh");
   if (!fs.exists("/gps")) fs.mkdir("/gps");
+  if (!fs.exists("/baro")) fs.mkdir("/baro");
 }
 
 bool startFlash() {
@@ -759,6 +789,7 @@ void syncSdMirror() {
   moveDirToSd("/hwo/nh", false);
   moveDirToSd("/hwo/ics", false);
   moveDirToSd("/gps", true);       // a day's track may already be on the card: append
+  moveDirToSd("/baro", true);
 }
 
 bool startSD() {
@@ -1121,7 +1152,7 @@ void seedNodes() { if (sdOK) seedNodesFrom(SD); else if (flashOK) seedNodesFrom(
 // ======================================================================
 // Flash only: keep ENV_FLASH_DAYS of climate files
 void pruneFlashDir(const char* dir);
-void pruneFlashEnv(const String& today) { pruneFlashDir("/env"); pruneFlashDir("/gps"); }
+void pruneFlashEnv(const String& today) { pruneFlashDir("/env"); pruneFlashDir("/gps"); pruneFlashDir("/baro"); }
 void pruneFlashDir(const char* dir) {
   if (!flashOK) return;
   time_t cut = time(nullptr) - (time_t)ENV_FLASH_DAYS * 86400;
@@ -1184,6 +1215,99 @@ void hubSensorTick() {
 }
 
 // ======================================================================
+//  Pressure (BMP388 inside the box): read every minute, the 10-minute average saved to its own track,
+//  /baro/YYYY-MM-DD.csv (a calendar day in the box's time zone): utc,hpa,box_c,n  (utc: the start of the
+//  10 minutes; n: readings averaged). The last 7 days are also kept in memory for BAROGRAPH and reloaded
+//  from the files after a restart. A 10 minutes with no reading (box off, sensor missing) has no row.
+// ======================================================================
+Adafruit_BMP3XX bmp;
+bool bmpOK = false, baroLoaded = false;
+float baroHpa = NAN, baroC = NAN;                         // the newest reading
+uint32_t lastBaroMs = 0, baroSlot = 0; double baroSum = 0, baroTSum = 0; uint16_t baroN = 0;
+const uint16_t BR_N = 7 * 144 + 1;                         // 10-minute slots: 7 days and one
+struct BrPt { uint16_t tag, v; };                         // tag: the slot's low 16 bits; v: (hPa - 300) x 50, 0xFFFF = empty
+BrPt* brRing = nullptr;                                    // 4 KB, taken from the heap only when there is a sensor
+void brPut(uint32_t slot, float hpa) { if (!brRing) return; BrPt& b = brRing[slot % BR_N]; b.tag = (uint16_t)slot; b.v = (uint16_t)constrain(lroundf((hpa - 300.0f) * 50.0f), 0L, 65534L); }
+float brGet(uint32_t slot) { if (!brRing) return NAN; const BrPt& b = brRing[slot % BR_N]; return b.v != 0xFFFF && b.tag == (uint16_t)slot ? 300.0f + b.v / 50.0f : NAN; }
+uint32_t brLast() {                                        // the newest slot with a value (0: none)
+  if (!timeValid) return 0;
+  uint32_t s = (uint32_t)time(nullptr) / BARO_SAVE_S;
+  for (uint32_t k = 0; k < 3; k++) if (!isnan(brGet(s - k))) return s - k;
+  return 0;
+}
+fs::FS* baroFS() { return sdOK ? (fs::FS*)&SD : (flashOK ? (fs::FS*)&LittleFS : nullptr); }
+void baroStart() {
+  bmpOK = bmp.begin_I2C(0x77) || bmp.begin_I2C(0x76);
+  if (!bmpOK) return;
+  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
+  bmp.setPressureOversampling(BMP3_OVERSAMPLING_8X);
+  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
+  brRing = (BrPt*)malloc(sizeof(BrPt) * BR_N);
+  if (brRing) for (uint16_t i = 0; i < BR_N; i++) brRing[i] = { 0, 0xFFFF };
+}
+void baroLoad() {                                          // the last 7 days from the files, once the clock is right
+  baroLoaded = true;
+  time_t t = time(nullptr);
+  for (int back = 7; back >= 0; back--) {
+    String p = "/baro/" + localDate(t - (time_t)back * 86400) + ".csv";
+    fs::FS* fs = (sdOK && SD.exists(p)) ? (fs::FS*)&SD : (flashOK && LittleFS.exists(p)) ? (fs::FS*)&LittleFS : nullptr;
+    if (!fs) continue;
+    File f = fs->open(p, FILE_READ); if (!f) continue;
+    while (f.available()) {
+      String l = f.readStringUntil('\n');
+      if (l.length() < 22 || l[0] == 'u') continue;
+      uint32_t ep = parseUtc(l.substring(0, 20)); int c = l.indexOf(',', 21);
+      float h = (c > 21 ? l.substring(21, c) : l.substring(21)).toFloat();
+      if (ep && h > 300 && h < 1200 && (uint32_t)t - ep < 7UL * 86400UL + BARO_SAVE_S) brPut(ep / BARO_SAVE_S, h);
+    }
+    f.close();
+  }
+}
+void baroSave(uint32_t slot, float hpa, float c, uint16_t n) {
+  brPut(slot, hpa);
+  fs::FS* fs = baroFS(); if (!fs) return;
+  if (fs == &LittleFS && LittleFS.totalBytes() - LittleFS.usedBytes() < 200 * 1024) return;   // keep room for the log
+  uint32_t ep = slot * BARO_SAVE_S;
+  if (!fs->exists("/baro")) fs->mkdir("/baro");
+  String path = "/baro/" + localDate(ep) + ".csv";
+  bool isNew = !fs->exists(path);
+  File f = fs->open(path, FILE_APPEND);
+  if (!f) { if (fs == &SD) sdOK = false; return; }
+  if (isNew) f.println("utc,hpa,box_c,n");
+  f.print(isoUtc(ep)); f.print(','); f.print(String(hpa, 2)); f.print(','); f.print(csvNum(c, 1)); f.print(','); f.println(n);
+  f.close();
+}
+void baroTick() {
+  if (!bmpOK) return;
+  if (timeValid && !baroLoaded) baroLoad();
+  if (lastBaroMs && millis() - lastBaroMs < BARO_READ_S * 1000UL) return;
+  lastBaroMs = millis();
+  if (!bmp.performReading()) return;
+  float h = bmp.pressure / 100.0f;
+  if (!(h > 300 && h < 1200)) return;                      // not a real reading
+  baroHpa = h; baroC = bmp.temperature;
+  if (!timeValid) return;
+  uint32_t slot = (uint32_t)time(nullptr) / BARO_SAVE_S;
+  if (slot != baroSlot) {
+    if (baroN && baroSlot) baroSave(baroSlot, baroSum / baroN, baroTSum / baroN, baroN);
+    baroSlot = slot; baroSum = 0; baroTSum = 0; baroN = 0;
+  }
+  baroSum += h; baroTSum += baroC; baroN++;
+}
+// the change over 3 hours, hPa: the newest saved 10 minutes against the one 3 hours before it (NAN if either is missing)
+float baro3h() { uint32_t l = brLast(); if (!l) return NAN; float a = brGet(l), b = brGet(l - 18); return isnan(a) || isnan(b) ? NAN : a - b; }
+// the shipping-forecast words for a 3-hour change in hPa
+String baroWord(float d) {
+  float a = fabsf(d);
+  if (a < 0.1f) return "Steady";
+  String w = d > 0 ? "Rising" : "Falling";
+  if (a <= 1.5f) return w + " slowly";
+  if (a <= 3.5f) return w;
+  if (a <= 6.0f) return w + " quickly";
+  return w + " very rapidly";
+}
+
+// ======================================================================
 //  Battery (MAX17048 on newer Feathers, LC709203F on older ones)
 // ======================================================================
 uint8_t battType = 0;            // 0 none, 1 MAX17048, 2 LC709203F
@@ -1201,7 +1325,8 @@ bool i2cRest = false;                                     // PIN_I2C_POWER's res
 // voltage is used. The % comes from that run's discharge curve: % of the charge left before BATT_OFF_V, where
 // the box switches itself off, so 0 % here means "about to switch off". The run drew a steady 27 mA; the box
 // draws more, which pulls the voltage down a little and reads a few % low, never high. While charging, the
-// cell's voltage is raised by the charger and says nothing about its charge, so no % is shown then.
+// cell's voltage is raised by the charger and says nothing about its charge, so no % is shown then, nor for
+// the first 2 minutes after it is unplugged, while the voltage settles.
 const float BCURVE[][2] = { {4.15, 100.0}, {4.13, 97.4}, {4.11, 96.0}, {4.09, 94.4}, {4.07, 92.7}, {4.05, 90.8}, {4.03, 86.4}, {4.01, 82.9}, {3.99, 81.0}, {3.97, 79.1}, {3.95, 77.2}, {3.93, 74.8}, {3.91, 69.0}, {3.89, 63.3}, {3.87, 60.2}, {3.85, 57.9}, {3.83, 56.0}, {3.81, 54.1}, {3.79, 52.4}, {3.77, 50.5}, {3.75, 48.5}, {3.73, 46.6}, {3.71, 44.3}, {3.69, 41.7}, {3.67, 38.5}, {3.65, 34.7}, {3.63, 30.1}, {3.61, 25.6}, {3.59, 22.2}, {3.57, 19.2}, {3.55, 16.5}, {3.53, 14.0}, {3.51, 11.9}, {3.49, 9.9}, {3.47, 8.0}, {3.45, 6.0}, {3.43, 4.3}, {3.41, 3.1}, {3.39, 2.3}, {3.37, 1.6}, {3.35, 1.1}, {3.33, 0.6}, {3.30, 0.0} };
 const int BCURVE_N = sizeof(BCURVE) / sizeof(BCURVE[0]);
 float pctFromV(float v) {
@@ -1223,14 +1348,22 @@ float vMed(uint8_t from, uint8_t n) {                      // median of n readin
 struct BSamp { uint32_t ms; float p; };
 const uint16_t BH = 361;                                  // one % reading a minute, the last 6 hours: for the rate and the time left
 BSamp bHist[BH]; uint16_t bHN = 0, bHI = 0; uint32_t bHLast = 0;
-bool battChg = false; float chgPeak = 0, battLeftH = NAN; bool battSpanOk = false;
+bool battChg = false; float chgPeak = 0, battLeftH = NAN; bool battSpanOk = false;   // battChg: on USB power
+uint32_t usbOffMs = 0;                                    // when it was last unplugged (USB_PIN wired; 0: not since start-up)
+extern bool redraw;
+bool usbIn() { return USB_PIN >= 0 && analogReadMilliVolts(USB_PIN) > USB_MV; }
 void battHistClear() { bHN = 0; bHI = 0; bHLast = 0; battRate = NAN; battLeftH = NAN; battSpanOk = false; }
 void battRead() {
   float v = NAN;
   if (battType == 1) v = gaugeMax.cellVoltage(); else if (battType == 2) v = gaugeLc.cellVoltage();
   if (isnan(v) || v < 2.5f) { battV = v; battPct = NAN; battHistClear(); return; }   // no cell
   vBuf[vI] = v; vI = (vI + 1) % VB; if (vN < VB) vN++;
-  // Charging: the median of the newest 3 readings 30 mV over the median of those 3 to 7 minutes before. Running
+  if (USB_PIN >= 0) {                                      // the USB pin says it: no guessing
+    battV = vMed(0, 10);
+    battPct = battChg || (usbOffMs && millis() - usbOffMs < 120000UL) ? NAN : pctFromV(battV);
+    if (isnan(battPct)) return;
+  } else {
+  // Not wired: charging is guessed. The median of the newest 3 readings 30 mV over the median of those 3 to 7 minutes before. Running
   // down, the cell never does that (4 days of 1-minute readings: at most 14 mV); a charger lifts it 30-100 mV.
   // Unplugged: 40 mV below the highest it reached while charging.
   float v3 = vMed(0, 3), vOld = vMed(6, 9);
@@ -1239,6 +1372,7 @@ void battRead() {
   battV = vMed(0, 10);
   battPct = battChg ? NAN : pctFromV(battV);
   if (battChg) return;
+  }
   // Rate: a straight line through up to the last 6 hours of readings, once there is an hour of them. On the
   // 4-day run, an hour gave the time left within about 15 % (median), 6 hours within about 3 %; the flat
   // stretch near 3.90 V, where the voltage hardly moves, is the hardest part.
@@ -1254,7 +1388,18 @@ void battRead() {
 bool battCharging() { return battChg; }
 bool battLow() { return !isnan(battV) && battV > 2.5f && battV < BATT_OFF_V && !battCharging(); }   // under 2.5 V: no cell, or no reading
 
+uint32_t lastUsbMs = 0;
+void usbTick() {                                          // once a second: plugged in or out shows straight away
+  if (USB_PIN < 0 || millis() - lastUsbMs < 1000) return;
+  lastUsbMs = millis();
+  bool u = usbIn();
+  if (u == battChg) return;
+  battChg = u; redraw = true;
+  if (!u) { usbOffMs = millis(); vN = 0; vI = 0; }         // the readings taken on the charger say nothing now
+  battHistClear(); battPct = NAN;
+}
 void battTick() {
+  usbTick();
   if (!battType || (lastBattMs && millis() - lastBattMs < BATT_READ_S * 1000UL)) return;
   lastBattMs = millis();
   battRead();
@@ -1286,6 +1431,23 @@ struct GpsState {
 } gps;
 char nmea[100];
 uint8_t nmeaLen = 0;
+// the last good fix, kept in flash for SUN & MOON: saved when it has moved 1 km, or once an hour
+struct LastFix { double lat = 0, lon = 0; uint32_t ep = 0; } lastFix, savedFix;
+const char* FIX_PATH = "/hwo/fix.json";
+void fixLoad() {
+  File f = LittleFS.open(FIX_PATH, FILE_READ); if (!f) return;
+  JsonDocument d; DeserializationError e = deserializeJson(d, f); f.close();
+  if (e || !d["lat"].is<double>() || !d["lon"].is<double>()) return;
+  lastFix.lat = d["lat"]; lastFix.lon = d["lon"]; lastFix.ep = d["ep"] | 0; savedFix = lastFix;
+}
+void fixKeep(uint32_t ep) {
+  lastFix.lat = gps.lat; lastFix.lon = gps.lon; lastFix.ep = ep;
+  if (!flashOK || (savedFix.ep && ep - savedFix.ep < 3600 && distM(savedFix.lat, savedFix.lon, lastFix.lat, lastFix.lon) < 1000)) return;
+  String tmp = String(FIX_PATH) + ".tmp";
+  File f = LittleFS.open(tmp, FILE_WRITE); if (!f) return;
+  f.printf("{\"lat\":%.5f,\"lon\":%.5f,\"ep\":%lu}", lastFix.lat, lastFix.lon, (unsigned long)ep); f.close();
+  if (replaceFile(LittleFS, tmp, FIX_PATH)) savedFix = lastFix;
+}
 
 bool gpsI2C = false;
 uint32_t lastGpsPoll = 0, lastGpsProbe = 0;
@@ -1391,6 +1553,7 @@ void gpsSentence(char* line) {
     if (!timeValid || isnan(gps.lat) || isnan(gps.lon) || gps.q == 0) return;
     if (!isnan(gps.hdop) && gps.hdop > GPS_MAX_HDOP) return;
     uint32_t now = (uint32_t)time(nullptr);
+    fixKeep(now);
     double m = gps.ptEpoch ? distM(gps.ptLat, gps.ptLon, gps.lat, gps.lon) : 1e9;
     if (gps.newSeg || !gps.ptEpoch || (now - gps.ptEpoch >= GPS_LOG_S && m >= GPS_MOVE_M) || now - gps.ptEpoch >= GPS_STILL_S) gpsLogPoint(now);
   }
@@ -1543,7 +1706,7 @@ const uint16_t C_ON = 15, C_DIM = 5, C_OFF = 0;    // grey levels (0-15)
 const uint8_t BTN_EXT  = 11;                      // BACK button (558), lower left on the lid: common to GND, NO to pin 11
 const uint8_t BTN_LED  = 18;                      // A0: BACK's LED ring +, LED - to GND (dimmed with PWM)
 const uint8_t BTN_LED_CH = 4;                     // LEDC channel for the light (0 and 1 are the buzzer's)
-const uint8_t BTN2_EXT = 9;                       // ACTION button (558), up and right of BACK: common to GND, NO to pin 9
+const uint8_t BTN2_EXT = 9;                       // SELECT button (558), up and right of BACK: common to GND, NO to pin 9
 const uint8_t BTN2_LED = 17;                      // A1: its LED ring +, LED - to GND
 const uint8_t BTN2_LED_CH = 5;
 const uint16_t BOTH_MS = 3000;                    // hold both buttons this long: the "both" shortcut
@@ -1553,28 +1716,30 @@ const uint8_t ENC_ADDRS[] = { 0x37, 0x38, 0x39 }; // encoder 5880: A0 closed = 0
 const int8_t  ENC_INT_PIN = -1;                   // its INT pad, if wired (e.g. 12); -1 = just read it every 20 ms
 const uint8_t ENC_SW = 24;                        // the encoder's push switch, on the seesaw chip
 const bool    ENC_REVERSE = false;                // scrolls the wrong way? set true
-const uint16_t ENC_OFF_MS = 1500;                 // hold the knob this long: screen off
+const uint16_t SEL_OFF_MS = 1500;                 // hold SELECT this long: screen off
 const uint8_t BUZ_A = 5, BUZ_B = 6;               // piezo (1739) wired between pins 5 and 6, driven in opposite phase
 const uint16_t BUZ_HZ = 2650;                     // the piezo's loudest note
 const uint16_t HOLD_MS = 600;
 const int ROWS = 13;                              // text rows under the title bar
 
-enum { S_STATUS, S_CL, S_TODAY, S_NOTES, S_TRIP, S_JOIN, S_WO, S_CARD, S_JOB, S_EXP, S_PCARD, S_CLOCK, S_COUNT };
-const char* SCR_KEY[] = { "status", "cl", "today", "notes", "map", "join", "wo", "card", "job", "exp", "pcard", "clock" };   // names in the dashboard's list
-const char* SCR_MENU[] = { "", "Checklist", "Today", "Notes", "Map today", "Join (Wi-Fi)", "Work orders", "Business card", "Job timer", "Expiring", "Personal card", "Clock" };
-uint8_t scrOrd[S_COUNT] = { S_STATUS, S_CL, S_TODAY, S_NOTES, S_WO, S_JOB, S_EXP, S_TRIP, S_JOIN, S_CLOCK };   // until the dashboard says otherwise
-int scrN = 10;                                           // scrOrd[0] is always LIFE LOGGER; the rest are its menu
+enum { S_STATUS, S_CL, S_TODAY, S_NOTES, S_TRIP, S_JOIN, S_WO, S_CARD, S_JOB, S_EXP, S_PCARD, S_CLOCK, S_SUN, S_BARO, S_COUNT };
+const char* SCR_KEY[] = { "status", "cl", "today", "notes", "map", "join", "wo", "card", "job", "exp", "pcard", "clock", "sun", "baro" };   // names in the dashboard's list
+const char* SCR_MENU[] = { "", "Checklist", "Today", "Notes", "Map today", "Join (Wi-Fi)", "Work orders", "Business card", "Job timer", "Expiring", "Personal card", "Clock", "Sun & Moon", "Barograph" };
+uint8_t scrOrd[S_COUNT] = { S_STATUS, S_CL, S_TODAY, S_NOTES, S_WO, S_JOB, S_EXP, S_TRIP, S_SUN, S_BARO, S_JOIN, S_CLOCK };   // until the dashboard says otherwise
+int scrN = 12;                                           // scrOrd[0] is always LIFE LOGGER; the rest are its menu
 struct BoxCard { std::vector<String> lines; std::vector<uint8_t> logo; int w = 0, h = 0; };
 BoxCard cards[2];                                        // BUSINESS and PERSONAL cards, already fitted to 21 characters; logo 4-bit grey, two pixels a byte
 std::vector<String> lbKeys, mapKeys;                     // the lines on LIFE LOGGER and MAP (empty: the usual ones)
 bool lbSet = false, mapSet = false;                      // the dashboard sent a list (it may be empty)
 int yOff = 0;                                            // LIFE LOGGER pushes the rows after a dividing line down a little
-String fSpd = "mph", fDist = "mi", fPos = "dd", fTemp = "F";
+String fSpd = "mph", fDist = "mi", fPos = "dd", fTemp = "F", fPres = "mmHg";
+float presIn(float hpa) { return fPres == "hPa" ? hpa : fPres == "inHg" ? hpa * 0.0295300f : hpa * 0.750062f; }
+int presDec() { return fPres == "inHg" ? 2 : 1; }
 uint32_t mqT0 = 0; bool mqOn = false;                     // the sliding (marquee) highlighted line
 bool oledOK = false, screenOn = false, bright = false;
 Adafruit_seesaw enc;
 bool encOK = false; uint8_t encAddr = 0;
-struct EncSw { bool down, longDone, swallow, turned; uint32_t t0; } encSw = {};
+struct EncSw { bool down, longDone, swallow, turned, woke; uint32_t t0; } encSw = {};   // the knob's push: ACTION
 uint32_t lastInputMs = 0;   // last turn or press, for the sleep timer
 uint8_t scr = S_STATUS;
 uint32_t lastDrawMs = 0, msgUntil = 0, ledBlinkUntil = 0, lastEncMs = 0;
@@ -1586,10 +1751,10 @@ bool redraw = true;
 
 struct Btn { uint8_t pin; bool down, held, raw, swallow, paired, woke; uint32_t t0, chg; };   // paired: the other button was down too; woke: its press only woke the screen
 Btn btn = { BTN_EXT }, btn2 = { BTN2_EXT };
-// the ACTION button's shortcuts (press, hold, and both buttons held), as the dashboard sets them
+// shortcuts, as the dashboard sets them: btnP for an ACTION (knob) press, btnB for BACK + SELECT held 3 s
 String btnP = "job", btnB = "phone";
-// ACTION's quick menu: hold ACTION, turn the knob, let go to run the highlighted row. It opens on Close,
-// so letting go without turning does nothing. Which rows, in what order: Settings > The box's screen.
+// ACTION's quick menu: hold the knob in and it opens (on Close) and stays open; turn to a row, press the knob
+// (or SELECT) to run it, BACK to close. Which rows, in what order: Settings > The box's screen.
 std::vector<String> qmKeys = { "screen", "gps", "job", "trip", "mark", "bnwas", "phone", "clock" };
 bool qmOn = false; int qmSel = 0, qmTop = 0;
 bool bothDone = false;                                   // both held long enough: their releases do nothing else
@@ -2038,7 +2203,7 @@ void todayLoad() {
     jobIds.push_back(kv.key().c_str()); jobNames.push_back(fit(ascii(kv.value() | ""), 40));
     jobBill.push_back((int)(doc["jobB"][kv.key().c_str()] | 0) != 0);
   }
-  fSpd = doc["fmt"]["spd"] | "mph"; fDist = doc["fmt"]["dist"] | "mi"; fPos = doc["fmt"]["pos"] | "dd"; fTemp = doc["fmt"]["temp"] | "F";
+  fSpd = doc["fmt"]["spd"] | "mph"; fDist = doc["fmt"]["dist"] | "mi"; fPos = doc["fmt"]["pos"] | "dd"; fTemp = doc["fmt"]["temp"] | "F"; fPres = doc["fmt"]["pres"] | "mmHg";
   for (JsonArray x : doc["wos"].as<JsonArray>()) {
     if (boxWos.size() >= 10) break;
     BoxWo w; w.no = ascii(x[0] | ""); w.title = ascii(x[1] | "");
@@ -2109,10 +2274,27 @@ void tripAddPoint(uint32_t ep, double la, double lo) {     // called just before
 }
 
 // ======================================================================
-//  Buzzer, timers, find-my-box, BNWAS
+//  Buzzer, vibration, timers, find-my-box, BNWAS
+//  Every alert has one pattern; Settings > The box picks where it goes: the piezo, the vibration motor or
+//  both (cfg.alert). With no motor fitted it always sounds, whatever the setting; find my box always sounds.
 // ======================================================================
 bool buzOK = false, buzOn = false;
 uint32_t buzHz = 0;
+Adafruit_DRV2605 drv;
+bool hapOK = false, hapOn = false;
+void hapStart() {
+  hapOK = drv.begin();
+  if (!hapOK) return;
+  drv.selectLibrary(1); drv.useERM();                      // the motor disc is an ERM
+  drv.setMode(DRV2605_MODE_REALTIME); drv.setRealtimeValue(0);
+}
+void hapSet(bool on) {                                     // the motor follows the alert's pattern as it plays
+  if (!hapOK || on == hapOn) return;
+  drv.setRealtimeValue(on ? 0x7F : 0); hapOn = on;
+}
+bool alertSound() { return !hapOK || cfg.alert != 1; }
+bool alertVibe() { return hapOK && cfg.alert != 0; }
+const char* ALERT_NAME[] = { "Sound", "Vibrate", "Both" };
 void buzSet(uint32_t hz) {
   if (!buzOK) return;
   if (!hz) { if (buzOn) { ledcWrite(BUZ_A, 0); ledcWrite(BUZ_B, 256); buzOn = false; } return; }   // 256 inverted = both pins low
@@ -2149,7 +2331,7 @@ void silence(bool box, uint32_t now) {
   for (size_t i = 0; i < timers.size();) { if (timers[i].ringing) timers.erase(timers.begin() + i); else i++; }
   findOn = false;
   if (box && cfg.bnwasOn) bnwasRestart(now);
-  buzSet(0); redraw = true;
+  buzSet(0); hapSet(false); redraw = true;
 }
 uint32_t bnLeftS(uint32_t now) {
   if (!cfg.bnwasOn) return 0;
@@ -2185,21 +2367,23 @@ void alarmsTick(uint32_t now) {
   } else if (tripBeeping()) {                             // "still on the work trip?": two short beeps every 3 s
     uint32_t ph = now % 3000;
     if (ph < 120 || (ph >= 240 && ph < 360)) hz = BUZ_HZ;
-  } else if ((int32_t)(beepUntil - now) > 0) hz = BUZ_HZ;  // the sound check
-  buzSet(hz);
+  } else if ((int32_t)(beepUntil - now) > 0) hz = BUZ_HZ;  // the alert check
+  bool finding = findOn && bnStage != 2 && !timerRinging();   // find my box always sounds: you can't hear a vibration across a room
+  buzSet(alertSound() || finding ? hz : 0); hapSet(alertVibe() && hz);
 }
 
 // ---- drawing ----
-static uint8_t prevFrame[128 * 64];
+static uint8_t* prevFrame = nullptr;                      // the last frame sent (8 KB, from the heap)
 bool frameStale = true;
 void pushFrame() {                       // sends only the rows that changed (a full frame is 8 KB of I2C)
   uint8_t* b = oled.buf(); if (!b) return;
+  if (!prevFrame) prevFrame = (uint8_t*)malloc(128 * 64);
   int y1 = -1, y2 = -1;
-  if (frameStale) { y1 = 0; y2 = 127; }
+  if (frameStale || !prevFrame) { y1 = 0; y2 = 127; }
   else for (int y = 0; y < 128; y++) if (memcmp(b + y * 64, prevFrame + y * 64, 64)) { if (y1 < 0) y1 = y; y2 = y; }
   if (y1 < 0) return;
   oled.win(y1, y2); oled.display();
-  memcpy(prevFrame, b, sizeof prevFrame); frameStale = false;
+  if (prevFrame) { memcpy(prevFrame, b, 128 * 64); frameStale = false; }
 }
 void head(const char* nm) {                             // the title, and the time (with seconds) and battery on the right
   String tm5, name = nm;
@@ -2211,7 +2395,7 @@ void head(const char* nm) {                             // the title, and the ti
     tm5 = b;
   }
   name = fit(name, max(4, 21 - (int)tm5.length() - 1));  // never let the clock run into the title
-  String r = tm5; if (battType && battChg) r += " chg"; else if (battType && !isnan(battPct)) r += " " + String((int)battPct) + "%";
+  String r = tm5; if (battType && battChg) r += USB_PIN >= 0 ? " USB" : " chg"; else if (battType && !isnan(battPct)) r += " " + String((int)battPct) + "%";
   if ((int)r.length() > 21 - (int)name.length() - 1) r = tm5;
   if ((int)r.length() > 21 - (int)name.length() - 1) r = "";
   oled.fillRect(0, 0, 128, 9, C_ON);
@@ -2305,16 +2489,24 @@ String lbLine(const String& k, uint16_t& col) {
   if (k == "gps" && gpsAsleep) return gpsMode == 2 ? String("GPS off (by hand)") : String("GPS asleep (home)");
   if (k == "gps") { bool g = gpsI2C && gps.seen && millis() - gps.lastNmeaMs < 5000; return !g ? String("GPS not found") : gps.fix ? "GPS fix " + String(gps.sats) + " sat" : "GPS no fix (" + String(gps.sats) + " sat)"; }
   if (k == "sd") return (sdOK ? String("SD ok") : String("SD none")) + "  " + String(gps.ptsDay == tripDay ? gps.ptsToday : 0) + " pts";
-  if (k == "batt") return !battType || isnan(battV) ? String("Battery --") : battChg ? "Battery chg " + String(battV, 2) + "V" : "Battery " + String((int)battPct) + "% " + String(battV, 2) + "V";
+  if (k == "batt") return !battType || isnan(battV) ? String("Battery --") : battChg ? String(USB_PIN >= 0 ? "Battery USB " : "Battery chg ") + String(battV, 2) + "V" : isnan(battPct) ? "Battery " + String(battV, 2) + "V" : "Battery " + String((int)battPct) + "% " + String(battV, 2) + "V";
   if (k == "volt") return !isnan(battV) ? "Battery " + String(battV, 2) + " V" : String("Battery --");
   if (k == "left") {
-    if (battChg) return battV >= 4.17f ? "Battery charged" : "Battery charging";
+    if (battChg) return battV >= 4.17f ? (USB_PIN >= 0 ? "On USB, charged" : "Battery charged") : (USB_PIN >= 0 ? "On USB, charging" : "Battery charging");
     if (isnan(battPct)) return "Time left --";
     if (!battSpanOk) return "Time left: measuring";
     if (isnan(battLeftH)) return "Time left: steady";
     float h = battLeftH; return "Time left ~" + (h < 48 ? String(h, h < 10 ? 1 : 0) + " h" : String(h / 24, 1) + " d");
   }
-  if (k == "chip") { float c = temperatureRead(); return "Box " + (fTemp == "C" ? String(c, 1) + "C" : String(c * 9 / 5 + 32, 1) + "F"); }
+  if (k == "pres") {
+    if (!bmpOK) return "Pressure: no sensor";
+    if (isnan(baroHpa)) return "Pressure --";
+    float d = baro3h(); String o = "Baro " + String(presIn(baroHpa), presDec()) + " " + fPres;
+    if (!isnan(d)) { float v = presIn(baroHpa) - presIn(baroHpa - d); o += String(v >= 0 ? " +" : " ") + String(v, 1); }
+    return o;
+  }
+  if (k == "sun") { String o; if (!sunLine(o)) col = C_DIM; return o; }
+  if (k == "chip") { float c = bmpOK && !isnan(baroC) ? baroC : temperatureRead(); return "Box " + (fTemp == "C" ? String(c, 1) + "C" : String(c * 9 / 5 + 32, 1) + "F"); }
   if (k == "up") { uint32_t u = millis() / 1000; snprintf(b, sizeof b, "Up %lud %02lu:%02lu", (unsigned long)(u / 86400), (unsigned long)(u / 3600 % 24), (unsigned long)(u / 60 % 60)); return b; }
   if (k.startsWith("n:")) { int p = k.indexOf('|'); String o; if (!tempLine(k.substring(2, p < 0 ? k.length() : p).c_str(), p < 0 ? "" : k.substring(p + 1).c_str(), o)) col = C_DIM; return o; }
   return "";
@@ -2401,7 +2593,7 @@ void clkGlyph(const uint8_t* px, const char* chars, uint8_t w, uint8_t h, char c
 }
 void clkText(int x, int y, const String& s, uint16_t c) { oled.setTextColor(c); oled.setCursor(x, y); oled.print(s); }
 void drawClock() {
-  if (battType && (battChg || !isnan(battPct))) { String p = battChg ? String("chg") : String((int)battPct) + "%"; clkText(126 - 6 * p.length(), 5, p, C_ON); }   // the battery, top right
+  if (battType && (battChg || !isnan(battPct))) { String p = battChg ? String(USB_PIN >= 0 ? "USB" : "chg") : String((int)battPct) + "%"; clkText(126 - 6 * p.length(), 5, p, C_ON); }   // the battery, top right
   if (battType && !isnan(battV)) { String v = String(battV, 2) + "V"; clkText(126 - 6 * v.length(), 17, v, C_DIM); }
   if (!timeValid) { clkText(28, 60, "Clock not set", C_DIM); return; }
   time_t t = time(nullptr); struct tm tm; localtime_r(&t, &tm);
@@ -2425,6 +2617,153 @@ void drawClock() {
   char ds[24]; snprintf(ds, sizeof ds, "%04d %02d-%02d", (tm.tm_year + 1900) % 10000, (tm.tm_mon + 1) % 100, tm.tm_mday % 100);   // 2026 11-21
   x = 6;
   for (const char* c = ds; *c; c++) { if (*c == ' ') { x += 7; continue; } clkGlyph(CLK_DATE, CLK_DATE_C, CLK_DATE_W, CLK_DATE_H, *c, x, 92); x += 12; }
+}
+
+// SUN & MOON: worked out on the box (astro.h) from the GPS fix, or the last fix kept in flash. The sun's day
+// is worked out once a day (and again if the box moves a km); the moon's rise and set once it passes the one
+// it was waiting for, every hour, or when the box moves.
+struct SunC { String day; double lat = 999, lon = 999; astro::SunDay d, tm; } sunC;   // d: today, tm: tomorrow
+struct MoonC { double lat = 999, lon = 999; uint32_t at = 0; astro::MoonNow m; } moonC;
+bool sunWhere(double& la, double& lo, String& src) {
+  bool fresh = gps.fix && millis() - gps.lastFixMs < 5000 && !isnan(gps.lat) && !isnan(gps.lon);
+  if (fresh) { la = gps.lat; lo = gps.lon; src = "GPS fix"; return true; }
+  if (!lastFix.ep) return false;
+  la = lastFix.lat; lo = lastFix.lon;
+  time_t f = lastFix.ep; struct tm tm; localtime_r(&f, &tm); char b[12];
+  if (timeValid && localDate(f) == localDate(time(nullptr))) { if (boxH12) snprintf(b, sizeof b, "%d:%02d%c", tm.tm_hour % 12 ? tm.tm_hour % 12 : 12, tm.tm_min, tm.tm_hour < 12 ? 'a' : 'p'); else strftime(b, sizeof b, "%H:%M", &tm); }
+  else strftime(b, sizeof b, "%b %d", &tm);
+  src = String("Fix ") + b;
+  return true;
+}
+time_t dayStart(time_t t, int plus) { struct tm tm; localtime_r(&t, &tm); tm.tm_hour = 0; tm.tm_min = 0; tm.tm_sec = 0; tm.tm_mday += plus; tm.tm_isdst = -1; return mktime(&tm); }
+bool sunCalc(String& src) {                                 // false: no position, or no clock
+  double la, lo;
+  if (!timeValid || !sunWhere(la, lo, src)) return false;
+  time_t now = time(nullptr); String d = localDate(now);
+  if (d != sunC.day || distM(la, lo, sunC.lat, sunC.lon) > 1000) {
+    time_t a = dayStart(now, 0), b = dayStart(now, 1), c = dayStart(now, 2);
+    sunC.d = astro::sunDay(la, lo, a, b); sunC.tm = astro::sunDay(la, lo, b, c);
+    sunC.day = d; sunC.lat = la; sunC.lon = lo;
+  }
+  uint32_t n = (uint32_t)now;
+  if (!moonC.at || n - moonC.at >= 3600 || (moonC.m.next && (time_t)n >= moonC.m.next) || distM(la, lo, moonC.lat, moonC.lon) > 1000) {
+    moonC.m = astro::moonNow(la, lo, now); moonC.at = n; moonC.lat = la; moonC.lon = lo;
+  } else if (n - moonC.at >= 60) {                           // the phase moves slowly: once a minute is plenty
+    astro::Pos m = astro::moonPos(now), sp = astro::sunPos(now);
+    moonC.m.frac = (1.0 - astro::cosd(m.lat) * astro::cosd(m.lon - sp.lon)) / 2.0; moonC.m.elong = astro::rev(m.lon - sp.lon);
+  }
+  return true;
+}
+String hm(time_t t) {                                       // 06:56, or 6:56a in 12-hour time
+  if (!t) return "--:--";
+  struct tm tm; localtime_r(&t, &tm); char b[10];
+  if (boxH12) snprintf(b, sizeof b, "%d:%02d%c", tm.tm_hour % 12 ? tm.tm_hour % 12 : 12, tm.tm_min, tm.tm_hour < 12 ? 'a' : 'p');
+  else snprintf(b, sizeof b, "%02d:%02d", tm.tm_hour, tm.tm_min);
+  return b;
+}
+String whenDay(time_t t) {                                  // " tmrw" / " yday" for an event not today
+  long d = dayNum(localDate(t)) - dayNum(localDate(time(nullptr)));
+  return d == 1 ? " tmrw" : d == -1 ? " yday" : "";
+}
+bool sunLine(String& o) {                                   // LIFE LOGGER: the next sunrise or sunset
+  String src;
+  if (!sunCalc(src)) { o = timeValid ? "Sun: no fix yet" : "Sun: clock not set"; return false; }
+  time_t now = time(nullptr);
+  if (sunC.d.rise && now < sunC.d.rise) o = "Sunrise " + hm(sunC.d.rise);
+  else if (sunC.d.set && now < sunC.d.set) o = "Sunset " + hm(sunC.d.set);
+  else if (sunC.tm.rise) o = "Sunrise " + hm(sunC.tm.rise) + " tmrw";
+  else o = sunC.d.all > 0 ? "Sun up all day" : "Sun down all day";
+  return true;
+}
+void drawSun() {
+  head("SUN & MOON");
+  String src;
+  if (!sunCalc(src)) {
+    if (!timeValid) { row(1, "Clock not set"); return; }
+    row(1, "No position yet"); row(2, "The GPS needs one fix", false, C_DIM); row(3, "(outdoors, a few", false, C_DIM); row(4, "minutes); it is kept", false, C_DIM); row(5, "after that", false, C_DIM);
+    return;
+  }
+  time_t now = time(nullptr); struct tm tm; localtime_r(&now, &tm); char ds[16]; strftime(ds, sizeof ds, "%a %b %d", &tm);
+  rowLR(0, ds, src, C_DIM);
+  const astro::SunDay& d = sunC.d;
+  if (d.all) { row(1, d.all > 0 ? "Sun up all day" : "Sun down all day"); rowLR(3, "Daylight", d.all > 0 ? "24h 00m" : "0h 00m"); }
+  else {
+    rowLR(1, "Sunrise", hm(d.rise)); rowLR(2, "Sunset", hm(d.set));
+    if (d.rise && d.set && d.set > d.rise) { long m = (long)(d.set - d.rise + 30) / 60; rowLR(3, "Daylight", String(m / 60) + "h " + (m % 60 < 10 ? "0" : "") + String(m % 60) + "m"); }
+    else rowLR(3, "Daylight", "--");
+  }
+  rowLR(4, "Civil", hm(d.cDawn) + " " + hm(d.cDusk), C_DIM);
+  rowLR(5, "Nautical", hm(d.nDawn) + " " + hm(d.nDusk), C_DIM);
+  if (d.noon) { char a[12]; snprintf(a, sizeof a, "  %d%c up", (int)lroundf(d.noonAlt), 248); rowLR(6, "Noon", hm(d.noon) + a, C_DIM); }
+  oled.drawFastHLine(0, 72, 128, C_DIM);
+  const astro::MoonNow& m = moonC.m;
+  bool wax = m.elong < 180; double f = m.frac;                 // the moon as it looks: lit on the right while it waxes (north of the equator)
+  bool flip = sunC.lat < 0; const int cx = 14, cy = 95, R = 12;
+  for (int y = -R; y <= R; y++) for (int x = -R; x <= R; x++) {
+    if (x * x + y * y > R * R + R * 0.6) continue;
+    double w = sqrt(max(0.0, 1.0 - (double)(y * y) / (R * R))), xt = (1 - 2 * f) * w, xx = (double)(flip ? -x : x) / R;
+    bool lit = wax ? xx >= xt : xx <= -xt;
+    oled.drawPixel(cx + x, cy + y, lit ? 14 : 2);
+  }
+  String L[5];
+  L[0] = astro::phaseName(m.elong);
+  L[1] = String((int)lround(f * 100)) + "% lit";
+  if (m.up) { L[2] = m.prev ? "Rose " + hm(m.prev) + whenDay(m.prev) : "Up"; L[3] = m.next ? "Sets " + hm(m.next) + whenDay(m.next) : "Sets --"; }
+  else { L[2] = m.prev ? "Set " + hm(m.prev) + whenDay(m.prev) : "Down"; L[3] = m.next ? "Rises " + hm(m.next) + whenDay(m.next) : "Rises --"; }
+  time_t nx = wax ? m.full : m.nu; long s = (long)(nx - now);
+  if (s < 0) s = 0;
+  L[4] = String(wax ? "Full in " : "New in ") + (s < 86400 ? String((s + 1800) / 3600) + "h" : String((s + 43200) / 86400) + "d");
+  for (int i = 0; i < 5; i++) { oled.setTextColor(i < 2 ? C_ON : C_DIM); oled.setCursor(32, 75 + i * 9); oled.print(fit(L[i], 16)); }
+  oled.setTextColor(C_ON);
+}
+
+// BAROGRAPH: the pressure, its 3-hour change and a graph of the saved 10-minute values. The knob picks the
+// span (sel: 0 = 24 h, 1 = 48 h, 2 = 7 days). A stretch with no values stays empty: nothing is drawn across it.
+const uint16_t BARO_SPAN_H[] = { 24, 48, 168 };
+void drawBaro() {
+  int span = constrain(sel, 0, 2);
+  head(span == 2 ? "BARO 7d" : span ? "BARO 48h" : "BARO 24h");
+  if (!bmpOK) { row(1, "No pressure sensor"); row(2, "BMP388 not found", false, C_DIM); return; }
+  if (isnan(baroHpa)) { row(1, "Reading..."); return; }
+  String v = String(presIn(baroHpa), presDec());
+  oled.setTextSize(2); oled.setTextColor(C_ON); oled.setCursor(1, 13); oled.print(v); oled.setTextSize(1);
+  oled.setTextColor(C_DIM); oled.setCursor(1 + 12 * v.length() + 4, 20); oled.print(fPres); oled.setTextColor(C_ON);
+  float d3 = baro3h();
+  if (isnan(d3)) rowLR(3, "3 h change", "--", C_DIM);
+  else {
+    float dv = presIn(baroHpa) - presIn(baroHpa - d3); String w = baroWord(d3), c = String(dv >= 0 ? "+" : "") + String(dv, fPres == "inHg" ? 2 : 1) + "/3h";
+    if (w.length() + c.length() < 21) rowLR(3, w, c, C_ON);
+    else { rowLR(2, "", c, C_ON); row(3, w); }             // "Falling very rapidly": the change goes up a row
+  }
+  if (!timeValid) { row(5, "Clock not set", false, C_DIM); return; }
+  const int gx = 26, gy = 48, gw = 101, gh = 62;
+  uint32_t last = (uint32_t)time(nullptr) / BARO_SAVE_S, n = BARO_SPAN_H[span] * 6, first = last - n;
+  float cmin[gw], cmax[gw], cend[gw]; float lo = 1e9, hi = -1e9;
+  for (int c = 0; c < gw; c++) { cmin[c] = NAN; cmax[c] = NAN; cend[c] = NAN; }
+  for (uint32_t k = 0; k < n; k++) {
+    float h = brGet(first + 1 + k); if (isnan(h)) continue;
+    float y = presIn(h); int c = (int)((uint64_t)k * gw / n);
+    if (isnan(cmin[c]) || y < cmin[c]) cmin[c] = y; if (isnan(cmax[c]) || y > cmax[c]) cmax[c] = y; cend[c] = y;
+    lo = min(lo, y); hi = max(hi, y);
+  }
+  for (int k = 0; k <= (span == 2 ? 7 : 4); k++) { int x = gx + (gw - 1) * k / (span == 2 ? 7 : 4); for (int y = gy; y < gy + gh; y += 2) oled.drawPixel(x, y, 3); }
+  for (int x = gx; x < gx + gw; x += 2) { oled.drawPixel(x, gy, 3); oled.drawPixel(x, gy + gh - 1, 3); }
+  oled.setTextColor(C_DIM);
+  const char* L0 = span == 2 ? "-7d" : span ? "-48h" : "-24h"; const char* L1 = span == 2 ? "" : span ? "-24h" : "-12h";
+  oled.setCursor(gx - 3 * strlen(L0), gy + gh + 3); oled.print(L0); oled.setCursor(gx + gw / 2 - 3 * strlen(L1), gy + gh + 3); oled.print(L1); oled.setCursor(127 - 18, gy + gh + 3); oled.print("now");
+  if (hi < lo) { oled.setCursor(gx + 14, gy + 26); oled.print("No values yet"); oled.setTextColor(C_ON); return; }
+  float minSpan = fPres == "hPa" ? 10 : fPres == "inHg" ? 0.3f : 8, step = fPres == "inHg" ? 0.1f : 1;   // a calm day stays flat
+  float L = floorf(lo / step) * step, H = ceilf(hi / step) * step;
+  if (H - L < minSpan) { float mid = (lo + hi) / 2; L = floorf((mid - minSpan / 2) / step) * step; H = L + minSpan; }
+  oled.setCursor(0, gy); oled.print(String(H, fPres == "inHg" ? 1 : 0)); oled.setCursor(0, gy + gh - 8); oled.print(String(L, fPres == "inHg" ? 1 : 0));
+  oled.setTextColor(C_ON);
+  auto Y = [&](float v) { return gy + gh - 1 - (int)lroundf((v - L) / (H - L) * (gh - 1)); };
+  for (int c = 0; c < gw; c++) {
+    if (isnan(cmin[c])) continue;
+    int x = gx + c;
+    if (c && !isnan(cend[c - 1])) oled.drawLine(x - 1, Y(cend[c - 1]), x, Y(cmin[c] < cend[c - 1] ? cmin[c] : cmax[c]), C_ON);
+    oled.drawFastVLine(x, Y(cmax[c]), Y(cmin[c]) - Y(cmax[c]) + 1, C_ON);
+  }
 }
 
 void drawScreen() {
@@ -2513,6 +2852,10 @@ void drawScreen() {
     }
   } else if (scr == S_CLOCK) {
     drawClock();
+  } else if (scr == S_SUN) {
+    drawSun();
+  } else if (scr == S_BARO) {
+    drawBaro();
   } else if (scr == S_EXP) {
     todayLoad(); head("EXPIRING");
     if (!expRows.size()) { row(1, "Nothing coming up"); row(2, "Expiring tab on the", false, C_DIM); row(3, "dashboard", false, C_DIM); }
@@ -2622,6 +2965,7 @@ int listLen() {
   if (scr == S_EXP) { todayLoad(); return expRows.size(); }
   if (scr == S_JOB) { todayLoad(); return jobOpts().size(); }
   if (scr == S_TRIP) return 2;
+  if (scr == S_BARO) return 3;                             // the graph's span: 24 h, 48 h, 7 days
   return 0;
 }
 void setScreen(int s) {   // each screen comes back where you left it
@@ -2652,6 +2996,7 @@ void screenPower(bool on) {
   on = on && oledOK;
   if (on == screenOn) return;
   screenOn = on;
+  if (!on) qmOn = false;
   if (oledOK) oled.oled_command(on ? SSD1327_DISPLAYON : SSD1327_DISPLAYOFF);
   if (on) { oled.setContrast(cfg.contrast); frameStale = true; redraw = true; }
 }
@@ -2694,7 +3039,7 @@ void press() {
   redraw = true;
 }
 void onShort() { if (!screenOn) return; if (encOK) back(); else nextScreen(); }
-// the ACTION button's shortcuts: home, clock, job timer, quick mark, work trip, screen off, find my phone, sound check, restart
+// the shortcuts (ACTION press, BACK + SELECT 3 s): home, clock, job timer, quick mark, work trip, screen off, find my phone, sound check, restart
 void jobQuick() {                                        // pause what's running, resume what's paused, else start the last one
   std::vector<JobOpt> O = jobOpts(); int k = -1;
   for (const char a : { 'P', 'R', 'A', 'G' }) { for (int i = 0; i < (int)O.size() && k < 0; i++) if (O[i].a == a) k = i; if (k >= 0) break; }
@@ -2725,7 +3070,8 @@ std::vector<QmRow> qmRows() {
     else if (k == "phone") r.push_back({ "Find my phone", "phone" });
     else if (k == "clock") r.push_back({ "Clock", "clock" });
     else if (k == "home") r.push_back({ "Home", "home" });
-    else if (k == "beep") r.push_back({ "Sound check", "beep" });
+    else if (k == "beep") r.push_back({ "Test alert", "beep" });
+    else if (k == "alert" && hapOK) r.push_back({ String("Alerts: ") + ALERT_NAME[cfg.alert] + " > " + ALERT_NAME[(cfg.alert + 1) % 3], "alert" });
     else if (k == "restart") r.push_back({ "Restart", "restart" });
   }
   return r;
@@ -2746,6 +3092,9 @@ void qmRun() {
   if (a.startsWith("gps")) {
     gpsMode = a[3] - '0'; lastGpsPower = 0;
     msg = gpsMode == 1 ? "GPS on" : gpsMode == 2 ? "GPS off" : (staUp ? "GPS auto: asleep" : "GPS auto: on"); msgUntil = millis() + 1500;
+  } else if (a == "alert") {
+    cfg.alert = (cfg.alert + 1) % 3; if (flashOK) cfgSave();
+    msg = String("Alerts: ") + ALERT_NAME[cfg.alert]; msgUntil = millis() + 1500;
   } else if (a == "bnwas") {
     cfg.bnwasOn = !cfg.bnwasOn; bnwasRestart(millis()); if (flashOK) cfgSave();
     msg = cfg.bnwasOn ? "BNWAS on" : "BNWAS off"; msgUntil = millis() + 1500;
@@ -2760,7 +3109,7 @@ void shortcut(const String& k) {
   else if (k == "trip") { if (WT.on) tripEnd(false); else tripStart(); }
   else if (k == "off") screenPower(false);
   else if (k == "phone") { findPhoneEp = time(nullptr); msg = "Calling phones"; msgUntil = millis() + 2000; ledBlinkUntil = millis() + 1200; }
-  else if (k == "beep") { beepOnce(); msg = "Sound check"; msgUntil = millis() + 1200; }
+  else if (k == "beep") { beepOnce(); msg = alertSound() && alertVibe() ? "Sound + vibrate" : alertVibe() ? "Vibrate" : "Sound"; msgUntil = millis() + 1200; }
   else if (k == "restart") { msg = "Restarting"; msgUntil = millis() + 2000; redraw = true; drawScreen(); delay(600); ESP.restart(); }
   redraw = true;
 }
@@ -2831,15 +3180,22 @@ void encTick(uint32_t now) {
   if (ENC_INT_PIN >= 0 && digitalRead(ENC_INT_PIN) == HIGH && !encSw.down) return;   // nothing new (INT pulls low on a turn or press)
   // push switch
   bool d = !enc.digitalRead(ENC_SW);
+  // ACTION (the knob's push): a press runs your shortcut, or the highlighted row while the quick menu is
+  // open; a hold opens the quick menu, which stays open: turn to a row, press to run it, BACK to close.
   if (d != encSw.down) {
     encSw.down = d;
-    if (d) { encSw.t0 = now; encSw.longDone = false; encSw.turned = false; encSw.swallow = touched(now); }
-    else {
-      if (!encSw.swallow && !encSw.longDone && !encSw.turned && screenOn && !qmOn) press();
+    if (d) {
+      encSw.t0 = now; encSw.longDone = false; encSw.turned = false;
+      bool wasOff = !screenOn && oledOK && !alarmActive() && !tripBeeping();
+      encSw.swallow = touched(now); encSw.woke = encSw.swallow && wasOff;   // only woke the screen: a hold still opens the menu
+    } else {
+      if (!encSw.swallow && !encSw.longDone && !encSw.turned) { if (qmOn) qmRun(); else shortcut(btnP); }
       encSw.swallow = false;
     }
   }
-  if (encSw.down && !encSw.swallow && !encSw.longDone && !encSw.turned && !qmOn && now - encSw.t0 >= ENC_OFF_MS) { encSw.longDone = true; screenPower(false); }
+  if (encSw.down && (!encSw.swallow || encSw.woke) && !encSw.longDone && !encSw.turned && !qmOn && !btn.down && now - encSw.t0 >= HOLD_MS) {
+    encSw.longDone = true; qmOn = true; qmSel = 0; qmTop = 0; lastInputMs = now; redraw = true;
+  }
   // turning
   int32_t delta = enc.getEncoderDelta();
   if (!delta) return;
@@ -2873,29 +3229,21 @@ void screenTick() {
     }
   }
   if (btn.down && !btn.held && !btn.swallow && !btn2.down && now - btn.t0 >= HOLD_MS) { btn.held = true; onHold(); }
-  // ACTION: a press runs its shortcut; a hold opens the quick menu (let go to run the highlighted row)
+  // SELECT: a press opens, ticks or starts what is highlighted (or runs the quick menu's row); a hold turns the screen off
   bool raw2 = digitalRead(btn2.pin) == LOW;
   if (raw2 != btn2.raw) { btn2.raw = raw2; btn2.chg = now; }
   if (now - btn2.chg > 25 && raw2 != btn2.down) {
     btn2.down = raw2;
-    if (raw2) {
-      btn2.t0 = now; btn2.held = false; btn2.paired = btn.down; if (btn.down) btn.paired = true;
-      bool wasOff = !screenOn && oledOK && !alarmActive() && !tripBeeping();
-      btn2.swallow = touched(now);
-      btn2.woke = btn2.swallow && wasOff;                  // this press only woke the screen: a hold still opens the menu
-    }
+    if (raw2) { btn2.t0 = now; btn2.held = false; btn2.paired = btn.down; if (btn.down) btn.paired = true; btn2.swallow = touched(now); }
     else {
-      if (qmOn) { if (!btn.down && !bothDone) qmRun(); else { qmOn = false; redraw = true; } }
-      else if (btn2.swallow) {}
-      else if (!btn2.held && !btn2.paired && !bothDone) shortcut(btnP);
+      if (btn2.swallow) {}
+      else if (!btn2.held && !btn2.paired && !bothDone && screenOn) { if (qmOn) qmRun(); else press(); }
       btn2.swallow = false;
       if (!btn.down) bothDone = false;
     }
   }
-  if (btn2.down && !btn2.held && (!btn2.swallow || btn2.woke) && !btn.down && now - btn2.t0 >= HOLD_MS) {
-    btn2.held = true; qmOn = true; qmSel = 0; qmTop = 0; lastInputMs = now; redraw = true;
-  }
-  if (qmOn && btn.down) { qmOn = false; redraw = true; }    // BACK while the menu is open: close it, run nothing
+  if (btn2.down && !btn2.held && !btn2.swallow && !btn.down && now - btn2.t0 >= SEL_OFF_MS) { btn2.held = true; qmOn = false; screenPower(false); }
+  if (qmOn && btn.down && !btn.paired) { qmOn = false; btn.paired = true; redraw = true; }   // BACK while the menu is open: close it, run nothing else
   // both held: the third shortcut, once
   if (btn.down && btn2.down && !bothDone && now - max(btn.t0, btn2.t0) >= BOTH_MS) { bothDone = true; btn.held = btn2.held = true; btn.swallow = btn2.swallow = false; shortcut(btnB); }
   encTick(now);
@@ -2921,6 +3269,7 @@ String alarmsJson() {
     s += "{\"id\":" + String(t.id) + ",\"name\":" + jStr(t.name) + ",\"secs\":" + String(t.secs) + ",\"left\":" + String(t.left(now)) + ",\"ring\":" + jBool(t.ringing) + "}";
   }
   s += "],\"find\":" + jBool(findOn) + ",\"findLeft\":" + String(findOn ? (FIND_MAX_MS - min(FIND_MAX_MS, now - findSince)) / 1000 : 0);
+  s += ",\"alert\":\"" + String(cfg.alert == 0 ? "sound" : cfg.alert == 1 ? "vibrate" : "both") + "\",\"motor\":" + jBool(hapOK);
   s += ",\"bnwas\":{\"on\":" + jBool(cfg.bnwasOn) + ",\"min\":" + String(cfg.bnwasMin) + ",\"stage\":" + String(bnStage) + ",\"left\":" + String(bnLeftS(now)) + "}}";
   return s;
 }
@@ -2949,6 +3298,12 @@ void handleTimersPost() {
     bool chg = on != cfg.bnwasOn || mn != cfg.bnwasMin;
     cfg.bnwasOn = on; cfg.bnwasMin = mn;
     if (chg) { bnwasRestart(now); if (flashOK && !cfgSave()) { sendErr(503, "Could not save"); return; } }
+  } else if (op == "test") {                              // the dashboard's Test: one beep, buzz or both
+    beepOnce();
+  } else if (op == "alert") {                             // {"op":"alert","mode":"sound"|"vibrate"|"both"}
+    String m = d["mode"] | ""; int a = m == "sound" ? 0 : m == "vibrate" ? 1 : m == "both" ? 2 : -1;
+    if (a < 0) { sendErr(400, "mode: sound, vibrate or both"); return; }
+    if (a != cfg.alert) { cfg.alert = a; if (flashOK && !cfgSave()) { sendErr(503, "Could not save"); return; } }
   } else if (op == "screen") {                            // {"op":"screen","offMin":5} and/or {"on":true}
     if (d["offMin"].is<int>()) {
       int m = d["offMin"];
@@ -3149,7 +3504,7 @@ void handleStatus() {
   s += "{\"fw\":\"" FW_VERSION "\"";
   kvU(s, "epoch", (uint32_t)t); kvS(s, "local", isoLocal(t));
   kvS(s, "tz", cfg.tz); kvB(s, "setupDone", cfg.setupDone);
-  if (findPhoneEp) kvU(s, "findPhone", findPhoneEp);      // the ACTION shortcut asked the open dashboards to sound
+  if (findPhoneEp) kvU(s, "findPhone", findPhoneEp);      // a shortcut asked the open dashboards to sound
   kvB(s, "passSet", passSet()); kvB(s, "login", needLogin()); kv(s, "remembered", String(sessKept()));
   kvB(s, "timeValid", timeValid); kvS(s, "timeSrc", timeSrc); kvB(s, "rtcOK", rtcOK);
   kvS(s, "store", storeName); kvB(s, "storeOK", store != nullptr); kvB(s, "flashOK", flashOK);
@@ -3165,11 +3520,15 @@ void handleStatus() {
   kvU(s, "channel", WiFi.channel()); kvS(s, "mdns", String(MDNS_NAME) + ".local");
   uint8_t m[6]; WiFi.macAddress(m); kvS(s, "hubMac", macStr(m));
   kvU(s, "uptime", millis() / 1000); kvU(s, "heap", ESP.getFreeHeap());
-  s += ",\"batt\":{\"ok\":" + jBool(battType != 0); kv(s, "pct", jNum(battPct, 0)); kv(s, "v", jNum(battV, 2)); kv(s, "rate", jNum(battRate, 2)); kv(s, "left", jNum(battLeftH, 1)); kvB(s, "chg", battChg); kvB(s, "measuring", !battChg && !battSpanOk); kv(s, "offV", jNum(BATT_OFF_V, 2)); s += "}";
+  s += ",\"batt\":{\"ok\":" + jBool(battType != 0); kv(s, "pct", jNum(battPct, 0)); kv(s, "v", jNum(battV, 2)); kv(s, "rate", jNum(battRate, 2)); kv(s, "left", jNum(battLeftH, 1)); kvB(s, "chg", battChg); kvB(s, "usbSense", USB_PIN >= 0); kvB(s, "measuring", !battChg && !battSpanOk); kv(s, "offV", jNum(BATT_OFF_V, 2)); s += "}";
   s += ",\"gps\":{\"mode\":\"" + String(gpsMode == 1 ? "on" : gpsMode == 2 ? "off" : "auto") + "\",\"asleep\":" + jBool(gpsAsleep) + ",\"seen\":" + jBool(gps.seen && millis() - gps.lastNmeaMs < 5000); kvB(s, "fix", gps.fix); kvU(s, "sats", gps.sats); kv(s, "kn", jNum(gps.kn, 1));
   if (gps.lastFixMs) { kv(s, "lat", String(gps.lat, 6)); kv(s, "lon", String(gps.lon, 6)); kvU(s, "fixAge", (millis() - gps.lastFixMs) / 1000); }
   kvU(s, "ptsToday", gps.ptsDay == trackDate(t) ? gps.ptsToday : 0); kvS(s, "store", sdOK ? "sd" : "flash"); s += "}";
   kv(s, "alarm", alarmsJson());
+  { float d3 = baro3h(); uint32_t l = brLast();
+    s += ",\"baro\":{\"ok\":" + jBool(bmpOK); kv(s, "hpa", jNum(baroHpa, 2)); kv(s, "d3", jNum(d3, 2)); kvS(s, "word", isnan(d3) ? String("") : baroWord(d3));
+    kv(s, "boxC", jNum(baroC, 1)); kvU(s, "saveS", BARO_SAVE_S); if (l) kvU(s, "lastEp", l * BARO_SAVE_S); s += "}"; }
+  if (lastFix.ep) { s += ",\"lastFix\":{\"lat\":" + String(lastFix.lat, 5); kv(s, "lon", String(lastFix.lon, 5)); kvU(s, "ep", lastFix.ep); s += "}"; }
   s += ",\"screen\":{\"ok\":" + jBool(oledOK); kvB(s, "on", screenOn); kvB(s, "enc", encOK); kvU(s, "encAddr", encAddr); kvU(s, "offMin", cfg.scrOffMin); kvB(s, "clHide", cfg.clHideDone); s += "}";
   kvB(s, "gpsBus", gpsI2C);
   s += ",\"nodes\":[";
@@ -3215,8 +3574,8 @@ void handleLogPost() {
               "{\"ok\":true,\"first\":" + String(first) + ",\"last\":" + String(logNextSeq - 1) + ",\"ts\":" + jStr(ts) + "}");
 }
 
-void listEnvDays(fs::FS& fs, String& out, bool& first, const String& skipIn) {
-  File d = fs.open("/env");
+void listEnvDays(fs::FS& fs, String& out, bool& first, const String& skipIn, const char* dir = "/env") {
+  File d = fs.open(dir);
   if (!d) return;
   File e = d.openNextFile();
   while (e) {
@@ -3253,6 +3612,26 @@ bool validDate(const String& d) {
   return true;
 }
 
+void handleBaroDays() {                                    // ["2026-11-20", ...]: days with a pressure track
+  String s = "[";
+  bool first = true;
+  if (sdOK) listEnvDays(SD, s, first, "", "/baro");
+  if (flashOK) listEnvDays(LittleFS, s, first, s, "/baro");
+  s += "]";
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json", s);
+}
+void handleBaro() {                                        // one day's pressure track: utc,hpa,box_c,n
+  String d = server.arg("date");
+  if (!validDate(d)) { sendErr(400, "date=YYYY-MM-DD"); return; }
+  String path = "/baro/" + d + ".csv";
+  fs::FS* fs = (sdOK && SD.exists(path)) ? (fs::FS*)&SD : (flashOK && LittleFS.exists(path)) ? (fs::FS*)&LittleFS : nullptr;
+  if (!fs) { sendErr(404, "No file for that date"); return; }
+  File f = fs->open(path, FILE_READ);
+  server.sendHeader("Cache-Control", "no-store");
+  server.streamFile(f, "text/csv");
+  f.close();
+}
 void handleEnv() {
   String d = server.arg("date");
   if (!validDate(d)) { sendErr(400, "date=YYYY-MM-DD"); return; }
@@ -3727,6 +4106,8 @@ void setupWeb() {
   server.on("/api/log", HTTP_POST, G(handleLogPost));
   server.on("/api/envdays", HTTP_GET, G(handleEnvDays));
   server.on("/api/env", HTTP_GET, G(handleEnv));
+  server.on("/api/barodays", HTTP_GET, G(handleBaroDays));
+  server.on("/api/baro", HTTP_GET, G(handleBaro));
   server.on("/api/time", HTTP_POST, G(handleTime));
   server.on("/dl", HTTP_GET, G(handleDownload));
   server.on("/update", HTTP_GET, []() { sendGz(UPDATE_HTML_GZ, sizeof UPDATE_HTML_GZ); });
@@ -3891,7 +4272,7 @@ void lowBattOff() {
   Serial.printf("Battery %.2f V: switching off\n", battV);
   heartbeatNow(true);                                      // the off time is measured from now, and History will say why
   lowShow("BATTERY LOW", "Switched off.", "Charge it, then", "press power off & on", 6000);
-  ledcWrite(BTN_LED, 0); ledcWrite(BTN2_LED, 0);
+  ledcWrite(BTN_LED, 0); ledcWrite(BTN2_LED, 0); buzSet(0); hapSet(false);
   WiFi.mode(WIFI_OFF);
   if (sdOK) SD.end();                                      // every write is already closed; this just lets go of the card
   if (flashOK) LittleFS.end();
@@ -3922,6 +4303,9 @@ void setup() {
     rtc.start();
   }
   hubSht = sht.begin(0x44);
+  baroStart();
+  hapStart();
+  if (USB_PIN >= 0) { pinMode(USB_PIN, INPUT); analogSetPinAttenuation(USB_PIN, ADC_11db); }
   eeStart();
   Wire.setClock(400000);
   battStart();
@@ -3929,7 +4313,7 @@ void setup() {
   screenStart();
 
   flashOK = startFlash();
-  if (flashOK) { cfgLoad(); sessLoad(); } else cfgDefaults();
+  if (flashOK) { cfgLoad(); sessLoad(); fixLoad(); } else cfgDefaults();
   tripResume();
   setenv("TZ", cfg.tz.c_str(), 1); tzset();
   sdOK = startSD();
@@ -3938,6 +4322,7 @@ void setup() {
   seedNodes();
 
   Serial.printf("Screen %s  GPS %s\n", oledOK ? "ok" : "none", gpsI2C ? "ok" : "none");
+  Serial.printf("BMP388 %s  vibration motor %s  USB sense %s\n", bmpOK ? "ok" : "none", hapOK ? "ok" : "none", USB_PIN >= 0 ? "A2" : "off");
   Serial.printf("Flash %s  SD %s  RTC %s  EEPROM %s  SHT30 %s  battery gauge %s   log: %s, %lu events\n",
                 flashOK ? "ok" : "FAILED (partition scheme?)", sdOK ? "ok" : "none", rtcOK ? "ok" : "none",
                 eeOK ? "ok" : "none", hubSht ? "yes" : "no", battType == 1 ? "MAX17048" : battType == 2 ? "LC709203F" : "none",
@@ -3972,6 +4357,7 @@ void loop() {
   outageCheck();
   heartbeatTick();
   hubSensorTick();
+  baroTick();
   envLogTick();
   wifiTick();
 
