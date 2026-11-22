@@ -1,38 +1,60 @@
 /*
-  Life Logger  v2.0   (was HWOT / HouseWO hub)
+  Life Logger  v2.2   life_logger.ino
   Sophie Scopazzi / Aspect Wave LLC
 
   A carry-around box: work orders, daily checklist, calendar, GPS track, house climate,
   expiring documents, kitchen timers, find-my-box and a BNWAS-style move reminder.
 
-  Board : Adafruit ESP32-S2 Feather (LiPo + fuel gauge on board)
+  Board : Adafruit ESP32-S2 Feather with w.FL (6282; LiPo + fuel gauge on board), Wi-Fi on an external
+          antenna: w.FL to an RP-SMA bulkhead (5444) on the right-hand side
           + Adalogger FeatherWing (PCF8523 RTC + microSD, CS 10)   RTC, climate + GPS archive, log copy
           + Mini GPS PA1010D (Adafruit 4415) on I2C, 0x10           track + clock away from home
-          + 1.5" 128x128 grayscale OLED (4741, SSD1327, STEMMA QT, I2C 0x3D)   status / checklist / today / notes / trip / join
+          + 1.5" 128x128 grayscale OLED (4741, SSD1327, STEMMA QT, I2C 0x3D)   home menu, checklist, today, notes, work orders, job timer, expiring, map, cards, join
           + piezo (1739) between pins 5 and 6                        timers, find-my-box, BNWAS
           + knob: I2C rotary encoder with push switch (5880, seesaw), STEMMA QT, 0x37 (A0 jumper closed)
             optional: its INT pad to pin 12 (set ENC_INT_PIN) so the box only reads it when it moves
-          + button: momentary (558), pin 11 to GND; its LED ring + on A0 (pin 18)
+          + two lit buttons on the lid, left of the screen (558 each); the knob comes out of the right-hand side:
+              BACK (lower left): pin 11 to GND, its LED ring + on A0 (pin 18)
+              ACTION (upper right): pin 9 to GND, its LED ring + on A1 (pin 17); a press runs a shortcut, a hold opens
+                the quick menu (turn the knob, let go to run the row); both set on the dashboard
+              hold BACK + turn the knob: screen brightness · hold both 3 s: a third shortcut (find my phone, …)
           + I2C EEPROM breakout (24LC32 or larger, 0x50)             on/off record
           + SHT30 on STEMMA QT (optional)                            shows up as node "Hub"
   Power switch: latching button (916) - common to GND, normally-closed contact to EN: button out = off.
     Off = regulator off; the LiPo still charges on USB. (Terminal FeatherWing: leave its slide switch ON.)
-  Arduino IDE: Tools > Partition Scheme > "Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)"
+  Partitions: partitions.csv in this folder (two 1.5 MB app slots for .lbk updates, 896 KB flash storage) is
+  used whatever the menu says. In the Arduino IDE pick Tools > Partition Scheme > "Minimal SPIFFS (1.9MB APP
+  with OTA)" only so its size check allows more than 1.25 MB; the real limit is 1,572,864 bytes.
 
   Wi-Fi: joins the house Wi-Fi whenever it is in range (scans for it every minute or so while away)
     and always runs its own hotspot. Away from home, connect the phone to the hotspot.
 
   Storage:
-    Internal flash (LittleFS) holds the work-order log /hwo/log.jsonl — one JSON line per change,
-    append-only, so it is also the full audit trail.
-    SD card: log copy, climate CSVs (/env), GPS track CSVs (/gps), attachments (/att), checklist
-    archive and imported calendars. Without a card, climate and GPS keep ENV_FLASH_DAYS in flash.
+    SD card: the work-order log /hwo/log.jsonl — one JSON line per change, append-only, so it is also
+    the full audit trail — plus climate CSVs (/env), GPS track CSVs (/gps), attachments (/att), checklist
+    archive and imported calendars.
+    Internal flash (LittleFS, 896 KB, see partitions.csv): the dashboard, checklist, notes, settings, and a
+    copy of the log while it fits, so the box keeps working with the card out (it carries on in flash and
+    the card catches up when it's back). Once the log outgrows flash the copy is dropped and the box
+    needs its card to save. Without a card, climate and GPS keep ENV_FLASH_DAYS in flash.
 
-  House nodes: while the box is away they keep their own readings and send them in when it is back
-    (node firmware 2.0+). That fill-in needs the SD card in the box.
+  House nodes: while the box is away they keep their own readings and send them in when it is back.
+    That fill-in needs the SD card in the box.
+
+  Write safety: every log line ends with its CRC-32 ("k"). At start-up each line is checked; damaged ones
+    (a line cut by a power cut, a bad card sector) are moved to /hwo/log.bad, and when the card and flash
+    copies differ, the one with more good lines wins. Rewritten files (settings, checklist, notes) are
+    written to <name>.tmp and swapped in; start-up finishes or discards an interrupted swap.
+
+  Low battery: below 3.30 V for 30 s and not charging, the box finishes writing and switches itself off
+    (deep sleep with no wake source, STEMMA QT power off). It stays off until the power button is pressed
+    out and in again; charge it first.
+
+  GPS: asleep (PMTK standby) while the box is on the home Wi-Fi, on elsewhere; the quick menu can set it
+    on or off by hand until the box restarts. A work trip keeps it on. Sleeps and wakes go in the log.
 
   Dashboard: kept in flash as /www/index.html.gz, not in the firmware. Updates are one .lbk file
-    (dashboard + firmware) uploaded from Setup > Firmware, or from the page the box shows when it has
+    (dashboard + firmware) uploaded from Settings > Firmware, or from the page the box shows when it has
     no dashboard yet (first install over USB).
 
   Documents: the daily checklist is one small JSON file (/hwo/doc/checklist.json, flash, copied to SD)
@@ -76,13 +98,15 @@
 #include <Adafruit_SSD1327.h>
 #include <ArduinoJson.h>
 #include <vector>
+#include <algorithm>
 #include <time.h>
 #include <sys/time.h>
 #include <mbedtls/sha256.h>
+#include <esp_sleep.h>
 #define HUB_AP_SSID "Life Logger"         // the starting hotspot, the same on every new box
 #define HUB_AP_PASS "lifelogger-setup"   // shown on the box's JOIN screen; first-boot setup makes you choose your own
 
-#define FW_VERSION "2.0"
+#define FW_VERSION "2.2"
 
 // ===================== USER SETTINGS =====================
 const bool  AP_ALWAYS      = true;          // keep the hotspot up even when on house Wi-Fi
@@ -101,9 +125,15 @@ const float    GPS_MOVE_M     = 15.0f;      // ...and only after moving at least
 const uint32_t GPS_STILL_S    = 300;        // standing still: one point every 5 min, so a gap means no fix
 const float    GPS_MAX_HDOP   = 5.0f;       // poorer fixes are not logged
 const uint32_t BATT_READ_S    = 30;
+// Low battery: below BATT_OFF_V for 30 s, and not charging, the box finishes what it is writing and switches
+// itself off (deep sleep with nothing set to wake it, the STEMMA QT parts unpowered). It stays off: charge it,
+// then press the power button out and in again. The LiPo's own protection cuts at 3.0 V, but the Feather's
+// 3.3 V regulator sags well before that, so the box would brown out mid-write; below about 3.3 V a LiPo has
+// only a few percent left anyway.
+const float    BATT_OFF_V     = 3.30f;
 // =========================================================
 
-// ---------- ESP-NOW packets: keep identical in HouseWO_Node ----------
+// ---------- ESP-NOW packets: keep identical in life_logger_node ----------
 #define HWO_MAGIC 0x31574F48UL   // "HOW1" node -> box: live reading (v1 37 bytes, v2 45 bytes)
 #define HWO_TIME  0x54574F48UL   // "HOWT" box -> node: clock, and whether it can take buffered readings
 #define HWO_BFILL 0x42574F48UL   // "HOWB" node -> box: readings kept while the box was away
@@ -174,8 +204,22 @@ bool flashOK = false, sdOK = false;
 fs::FS* store = nullptr;                 // where the work-order log lives
 const char* storeName = "none";
 const char* LOG_PATH = "/hwo/log.jsonl";
+// ---- types used by functions further down (Arduino puts the function prototypes near the top) ----
+struct TodayEv { String t1, t2, title, label; std::vector<String> det; };   // as the dashboard sends them: times in the clock's format; det = title, place and notes, already wrapped
+struct ExpRow { String date, name; };
+struct TmE { String id, prj, desc, wo; bool bill = false, paused = false, del = false; int64_t start = 0, end = 0; };   // ms; end 0 = running
+struct LogMark { uint32_t off, seq; bool undo; };
+struct JobSt { int run = -1, pz = -1, last = -1; uint32_t todayS = 0; };
+struct JobOpt { char a; int k; String t; };              // a: P pause, S stop, R resume, G go (k = jobIds index), A start the last one again
+struct Dev { String n; uint32_t ms; };
+struct GDay { String d; uint32_t own = 0, x = 0; };
+void jobScanLine(const char* head, uint32_t off);   // JOB TIMER: lines of the log worth reading (time entries, undos)
+void jobNote(const String& line, uint32_t off, uint32_t seq);
+void jobScanDone();
+void jobScanStart();
 uint32_t logNextSeq = 1;
 uint32_t logBytes = 0;
+struct LogPass { uint32_t good, bad, maxSeq, bytes; bool torn; };   // one pass over a log (see logPass)
 uint32_t lastSdRetry = 0;
 uint32_t lastEnvSlot = 0;
 String   lastPruneDay = "";
@@ -200,6 +244,7 @@ File uiFile;
 // ---------- EEPROM heartbeat ----------
 const uint16_t HB_BASE = 0x100, HB_SLOT = 16, HB_SLOTS = 240;   // 0x100-0xFFF, fits a 24LC32
 const uint16_t HB_MAGIC = 0xB7A5;
+const uint16_t HB_MAGIC_LOW = 0xB7A6;     // the last heartbeat before the box switched itself off for a low battery
 typedef struct __attribute__((packed)) {
   uint32_t seq;
   uint32_t epoch;
@@ -213,6 +258,8 @@ uint16_t hbNext = 0;
 uint32_t lastAlive = 0;          // epoch of the newest heartbeat found at boot
 uint32_t lastHbMs = 0;
 bool outageHandled = false;
+bool lowWoke = false;                                     // the last heartbeat before this start was a low-battery switch-off
+void heartbeatNow(bool lowOff);
 esp_reset_reason_t resetReason;
 
 // ---------- sensor nodes ----------
@@ -242,7 +289,7 @@ volatile uint8_t rxHead = 0, rxTail = 0;
 portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ======================================================================
-//  Settings kept on the box (first-boot setup / Setup > Network). Nothing personal is compiled in: the starting
+//  Settings kept on the box (first-boot setup / Settings > Network). Nothing personal is compiled in: the starting
 //  hotspot is public, and there is no default home Wi-Fi and no default box password.
 // ======================================================================
 struct Cfg { String apSsid, apPass, homeSsid, homePass, tz, passSalt, passHash; bool setupDone; int contrast; bool bnwasOn; int bnwasMin; int scrOffMin; bool clHideDone; } cfg;
@@ -274,12 +321,12 @@ bool cfgSave() {
   d["tz"] = cfg.tz; d["setupDone"] = cfg.setupDone; d["contrast"] = cfg.contrast; d["bnwasOn"] = cfg.bnwasOn; d["bnwasMin"] = cfg.bnwasMin; d["scrOffMin"] = cfg.scrOffMin; d["clHideDone"] = cfg.clHideDone;
   d["passSalt"] = cfg.passSalt; d["passHash"] = cfg.passHash;
   String out; serializeJson(d, out);
-  File f = LittleFS.open("/hwo/config.tmp", FILE_WRITE);
+  String tmp = String(CFG_PATH) + ".tmp";
+  File f = LittleFS.open(tmp, FILE_WRITE);
   if (!f) return false;
   bool ok = f.print(out) == out.length(); f.close();
-  if (!ok) return false;
-  LittleFS.remove(CFG_PATH);
-  return LittleFS.rename("/hwo/config.tmp", CFG_PATH);
+  if (!ok) { LittleFS.remove(tmp); return false; }
+  return replaceFile(LittleFS, tmp, CFG_PATH);
 }
 
 
@@ -406,10 +453,46 @@ size_t fileSize(fs::FS& fs, const char* path) {
   return n;
 }
 
+// Write safety. Every file that is rewritten (settings, the checklist, notes, the log when it is cleaned,
+// copies between flash and card) is written whole to <path>.tmp first, then swapped in. A power cut
+// leaves either the old file or the new one, never half of one: at start-up recoverTmps() finishes a swap
+// that was cut between its two steps (old file removed, new one not yet renamed) and throws away a .tmp
+// that was cut while being written (the old file is still there).
+bool replaceFile(fs::FS& fs, const String& tmp, const char* path) {
+  fs.remove(path);                    // FAT can't rename over a file; LittleFS can, but one rule for both
+  return fs.rename(tmp, path);
+}
+// a .tmp is only finished if it ends the way a whole file does: a JSON document with } or ], a log or CSV with a newline
+bool looksWhole(fs::FS& fs, const String& p) {
+  File f = fs.open(p, FILE_READ); if (!f) return false;
+  size_t n = f.size(); int last = -1;
+  for (size_t back = 1; back <= 4 && back <= n; back++) { f.seek(n - back); int c = f.read(); if (c != ' ' && c != '\r') { last = c; break; } }
+  f.close();
+  return last == '}' || last == ']' || last == '\n';
+}
+void recoverTmps(fs::FS& fs, const char* dir) {
+  File d = fs.open(dir); if (!d) return;
+  String names[24]; int n = 0;
+  File e = d.openNextFile();
+  while (e && n < 24) { String nm = e.name(); int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1); bool isDir = e.isDirectory(); e.close(); if (!isDir && nm.endsWith(".tmp")) names[n++] = nm; e = d.openNextFile(); }
+  if (e) e.close();
+  d.close();
+  for (int i = 0; i < n; i++) {
+    String t = String(dir) + "/" + names[i], base = t.substring(0, t.length() - 4);
+    if (fs.exists(base) || !looksWhole(fs, t)) fs.remove(t);   // cut while writing the .tmp: the old file (if any) stands
+    else { fs.rename(t, base); Serial.println("Finished an interrupted save: " + base); }
+  }
+}
+void recoverAllTmps(fs::FS& fs) {
+  static const char* dirs[] = { "/hwo", "/hwo/doc", "/hwo/nt", "/hwo/na", "/hwo/nh", "/hwo/cl", "/hwo/cx", "/hwo/ics", "/gps" };
+  for (const char* d : dirs) recoverTmps(fs, d);
+}
+
 bool copyFile(fs::FS& from, fs::FS& to, const char* path) {
   File a = from.open(path, FILE_READ);
   if (!a) return false;
-  File b = to.open(path, FILE_WRITE);
+  String tmp = String(path) + ".tmp";
+  File b = to.open(tmp, FILE_WRITE);
   if (!b) { a.close(); return false; }
   uint8_t buf[512];
   bool ok = true;
@@ -419,37 +502,175 @@ bool copyFile(fs::FS& from, fs::FS& to, const char* path) {
     if (b.write(buf, n) != (size_t)n) { ok = false; break; }
   }
   a.close(); b.close();
-  return ok;
+  if (!ok) { to.remove(tmp); return false; }
+  return replaceFile(to, tmp, path);
 }
 
-void scanLog() {
-  logNextSeq = 1; logBytes = 0;
-  if (!store) return;
-  File f = store->open(LOG_PATH, FILE_READ);
-  if (!f) return;
+// CRC-32 (IEEE 802.3, as in zip and PNG). Every log line ends with its checksum:
+//   {"seq":12,"ts":"2026-11-20T19:22:00-08:00","e":{...},"k":"1a2b3c4d"}
+// k is the CRC-32 of everything before ,"k": so the tail is always 16 characters.
+uint32_t crcTab[256]; bool crcReady = false;
+void crcInit() { for (uint32_t i = 0; i < 256; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320UL ^ (c >> 1) : c >> 1; crcTab[i] = c; } crcReady = true; }
+inline uint32_t crcUpd(uint32_t c, uint8_t x) { return crcTab[(c ^ x) & 0xFF] ^ (c >> 8); }
+uint32_t crc32Of(const char* p, size_t n) { if (!crcReady) crcInit(); uint32_t c = 0xFFFFFFFFUL; while (n--) c = crcUpd(c, (uint8_t)*p++); return ~c; }
+String logSeal(const String& body) {     // body = {"seq":..,"ts":..,"e":{...}   (no closing brace)
+  char k[9]; snprintf(k, sizeof k, "%08lx", (unsigned long)crc32Of(body.c_str(), body.length()));
+  return body + ",\"k\":\"" + k + "\"}";
+}
+bool tailOk(const uint8_t* t, uint32_t c) {   // t = a line's last 16 bytes, c = CRC of everything before them
+  if (memcmp(t, ",\"k\":\"", 6) || t[14] != '"' || t[15] != '}') return false;
+  uint32_t v = 0;
+  for (int i = 6; i < 14; i++) { char h = t[i]; int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : -1; if (d < 0) return false; v = (v << 4) | d; }
+  return v == ~c;
+}
+bool lineOk(const String& L) {
+  size_t n = L.length();
+  if (n < 24 || !L.startsWith("{\"seq\":")) return false;
+  if (!crcReady) crcInit();
+  uint32_t c = 0xFFFFFFFFUL; for (size_t i = 0; i < n - 16; i++) c = crcUpd(c, (uint8_t)L[i]);
+  return tailOk((const uint8_t*)L.c_str() + n - 16, c);
+}
+// checks a line as it streams past: the CRC runs 16 bytes behind, so at the newline the last 16 are the tail
+struct LineCk {
+  uint32_t c; uint8_t q[16]; uint8_t h; uint32_t len;
+  void start() { if (!crcReady) crcInit(); c = 0xFFFFFFFFUL; h = 0; len = 0; }
+  void put(uint8_t x) { if (len >= 16) c = crcUpd(c, q[h]); q[h] = x; h = (h + 1) & 15; len++; }
+  bool ok() const { if (len < 24) return false; uint8_t t[16]; for (int i = 0; i < 16; i++) t[i] = q[(h + i) & 15]; return tailOk(t, c); }
+};
+
+// One pass over a log: counts the lines whose checksum holds and the ones that don't (torn by a power
+// cut, damaged on the card), finds the highest seq, and (feed) hands good lines to the JOB TIMER scan.
+LogPass logPass(fs::FS& fs, bool feed) {
+  LogPass r = {0, 0, 0, 0, false};
+  File f = fs.open(LOG_PATH, FILE_READ);
+  if (!f) return r;
+  r.bytes = f.size();
   uint8_t buf[512];
-  uint32_t lines = 0; int last = -1;
+  uint32_t pos = 0, lineStart = 0;
+  char head[128]; int hl = 0;                            // the start of each line: enough to see its seq, date and op
+  LineCk ck; ck.start();
   while (true) {
     int n = f.read(buf, sizeof buf);
     if (n <= 0) break;
-    for (int i = 0; i < n; i++) if (buf[i] == '\n') lines++;
-    last = buf[n - 1];
+    for (int i = 0; i < n; i++) {
+      uint8_t x = buf[i];
+      if (x == '\n') {
+        head[hl] = 0;
+        if (ck.ok() && !strncmp(head, "{\"seq\":", 7)) {
+          r.good++;
+          uint32_t q = strtoul(head + 7, nullptr, 10); if (q > r.maxSeq) r.maxSeq = q;
+          if (feed) jobScanLine(head, lineStart);
+        } else if (ck.len) r.bad++;
+        lineStart = pos + i + 1; hl = 0; ck.start();
+      } else { if (hl < 127) head[hl++] = (char)x; ck.put(x); }
+    }
+    pos += n;
   }
-  logBytes = f.size();
+  if (ck.len) { r.bad++; r.torn = true; }                // the last line never got its newline
   f.close();
-  // A line torn by a power cut gets terminated so the next event starts clean;
-  // the dashboard skips any line it can't parse.
-  if (logBytes > 0 && last != '\n') {
-    File a = store->open(LOG_PATH, FILE_APPEND);
-    if (a) { a.print('\n'); a.close(); lines++; logBytes++; }
-  }
-  logNextSeq = lines + 1;
+  return r;
 }
 
+// Rewrites src into dst keeping only lines whose checksum holds. Damaged lines are not thrown away: they
+// go to /hwo/log.bad on the same storage, as found. addSeal: a line with no checksum at all (an old or
+// hand-made file being restored) gets one if it looks like a whole record.
+const char* LOG_BAD = "/hwo/log.bad";
+uint32_t logBadLines = 0;                                 // lines in log.bad, shown in Settings > Storage
+bool normalizeLog(fs::FS& fs, const char* src, const String& dst, bool addSeal, uint32_t& kept, uint32_t& bad) {
+  kept = bad = 0;
+  File a = fs.open(src, FILE_READ); if (!a) return false;
+  File b = fs.open(dst, FILE_WRITE); if (!b) { a.close(); return false; }
+  File x;                                                 // log.bad, opened on the first damaged line
+  String L; L.reserve(1024);
+  uint8_t buf[512]; bool ok = true, over = false;
+  auto flushLine = [&]() {
+    if (L.length() || over) {
+      String line = L;
+      bool good = !over && lineOk(line);
+      if (!good && !over && addSeal && line.startsWith("{\"seq\":") && line.endsWith("}") && line.indexOf(",\"k\":\"") < 0) { line = logSeal(line.substring(0, line.length() - 1)); good = true; }
+      if (good) { if (b.print(line + "\n") != line.length() + 1) ok = false; else kept++; }
+      else {
+        bad++;
+        if (!x) x = fs.open(LOG_BAD, FILE_APPEND);
+        if (x) { x.print(over ? String("(a line over 64 kB)") : L); x.print('\n'); }
+      }
+    }
+    L = ""; over = false;
+  };
+  while (ok) {
+    int n = a.read(buf, sizeof buf);
+    if (n <= 0) break;
+    for (int i = 0; i < n; i++) {
+      if (buf[i] == '\n') flushLine();
+      else if (L.length() < 65536) L += (char)buf[i];
+      else over = true;
+    }
+  }
+  flushLine();
+  a.close(); b.close(); if (x) x.close();
+  if (!ok) fs.remove(dst);
+  return ok;
+}
+
+uint32_t countLines(fs::FS& fs, const char* path) {
+  File f = fs.open(path, FILE_READ); if (!f) return 0;
+  uint8_t buf[512]; uint32_t n = 0; int k;
+  while ((k = f.read(buf, sizeof buf)) > 0) for (int i = 0; i < k; i++) if (buf[i] == '\n') n++;
+  f.close(); return n;
+}
+void countBadLines() { logBadLines = (sdOK ? countLines(SD, LOG_BAD) : 0) + (flashOK ? countLines(LittleFS, LOG_BAD) : 0); }
+
+void refreshFlashCopy();
+void scanLog() {
+  logNextSeq = 1; logBytes = 0;
+  if (!store) return;
+  jobScanStart();
+  LogPass r = logPass(*store, true);
+  if (r.bad) {                                            // set the damaged lines aside and read the log again
+    uint32_t kept, bad; String tmp = String(LOG_PATH) + ".tmp";
+    if (normalizeLog(*store, LOG_PATH, tmp, false, kept, bad) && replaceFile(*store, tmp, LOG_PATH)) {
+      Serial.printf("Log: %lu damaged line(s) moved to %s\n", (unsigned long)bad, LOG_BAD);
+      jobScanStart();
+      r = logPass(*store, true);
+      if (store == &SD) refreshFlashCopy();
+    } else if (r.torn) {                                  // couldn't rewrite: at least end the torn line so the next one starts clean
+      File a = store->open(LOG_PATH, FILE_APPEND);
+      if (a) { a.print('\n'); a.close(); r.bytes++; }
+    }
+  }
+  jobScanDone();
+  logBytes = r.bytes;
+  logNextSeq = r.maxSeq + 1;
+  countBadLines();
+}
+
+// The log lives on the SD card; flash keeps a copy while it has room (LOG_FLASH_KEEP free after it), so the
+// box still works with the card out. Once the log outgrows flash, the copy is dropped and the marker
+// /hwo/log.oncard says so: the box then needs its card to save.
+const char* LOG_ONCARD = "/hwo/log.oncard";
+const size_t LOG_FLASH_KEEP = 300 * 1024;                 // flash kept free for the dashboard, notes and updates
+bool flashCopy = false;                                   // flash holds the same log as the card
+size_t flashFree() { return flashOK ? LittleFS.totalBytes() - LittleFS.usedBytes() : 0; }
+void dropFlashCopy() {
+  if (!flashOK) return;
+  LittleFS.remove(LOG_PATH);
+  File m = LittleFS.open(LOG_ONCARD, FILE_WRITE); if (m) { m.print("the log is on the SD card"); m.close(); }
+  flashCopy = false;
+  Serial.println("Log outgrew flash: kept on the SD card only");
+}
+// flash takes a fresh copy of the card's log, if it fits
+void refreshFlashCopy() {
+  if (!flashOK || !sdOK || LittleFS.exists(LOG_ONCARD)) return;
+  LittleFS.remove(LOG_PATH);
+  size_t s = fileSize(SD, LOG_PATH);
+  if (s && flashFree() >= s + LOG_FLASH_KEEP) { if (copyFile(SD, LittleFS, LOG_PATH)) LittleFS.remove(LOG_ONCARD); }
+  else if (s) dropFlashCopy();
+  flashCopy = s && fileSize(LittleFS, LOG_PATH) == s;
+}
 void chooseStore() {
-  if (flashOK)    { store = &LittleFS; storeName = "flash"; }
-  else if (sdOK)  { store = &SD;       storeName = "sd"; }
-  else            { store = nullptr;   storeName = "none"; }
+  if (sdOK)  { store = &SD; storeName = "sd"; }
+  else if (flashOK && !LittleFS.exists(LOG_ONCARD)) { store = &LittleFS; storeName = "flash"; }
+  else       { store = nullptr; storeName = flashOK ? "card missing" : "none"; }
   scanLog();
 }
 
@@ -469,6 +690,7 @@ void ensureDirs(fs::FS& fs) {
 bool startFlash() {
   if (!LittleFS.begin(true)) return false;     // formats on first use
   ensureDirs(LittleFS);
+  recoverAllTmps(LittleFS);
   return true;
 }
 
@@ -514,13 +736,18 @@ void syncNotes() {
 // Card just mounted: make flash and card agree
 void syncSdMirror() {
   if (!flashOK || !sdOK) return;
+  // The two copies are written line for line together, so normally they match. When they don't (the card
+  // was out, a fresh card, a power cut between the two writes, or one copy damaged), the copy with more
+  // lines that check out is the whole one and the other takes a copy of it. Size alone can't decide:
+  // a copy with rubbish on the end is longer, not better.
   size_t f = fileSize(LittleFS, LOG_PATH), s = fileSize(SD, LOG_PATH);
-  if (f == 0 && s > 0) {                        // new/erased hub board: restore from the card
-    if (copyFile(SD, LittleFS, LOG_PATH)) Serial.println("Log restored from SD card");
-    scanLog();
-  } else if (f != s) {                          // card is behind (or a different card): refresh it
-    copyFile(LittleFS, SD, LOG_PATH);
-  }
+  bool onCard = LittleFS.exists(LOG_ONCARD);
+  if (f != s && f > 0 && !onCard) {
+    LogPass pf = logPass(LittleFS, false), ps = logPass(SD, false);
+    if (pf.good > ps.good) { copyFile(LittleFS, SD, LOG_PATH); Serial.printf("Log: the card caught up from flash (%lu lines)\n", (unsigned long)pf.good); }
+    else refreshFlashCopy();
+  } else if (s > 0 && s != f) refreshFlashCopy();            // the card is ahead (or a new board): flash takes a copy if it fits
+  flashCopy = fileSize(LittleFS, LOG_PATH) == fileSize(SD, LOG_PATH) && fileSize(SD, LOG_PATH) > 0;
   // checklist: restore from the card if flash has none, otherwise keep the card's copy current
   const char* CLP = "/hwo/doc/checklist.json";
   if (!LittleFS.exists(CLP) && SD.exists(CLP)) copyFile(SD, LittleFS, CLP);
@@ -537,21 +764,27 @@ void syncSdMirror() {
 bool startSD() {
   if (!SD.begin(SD_CS)) return false;
   ensureDirs(SD);
+  recoverAllTmps(SD);
   return true;
 }
 
 // Append event lines (one JSON object per line). Returns how many were written.
 int appendEvents(const String& body, String& tsOut, uint32_t& firstOut) {
   if (!store) return -1;
-  if (store == &LittleFS && LittleFS.totalBytes() - LittleFS.usedBytes() < body.length() * 2 + 16 * 1024) return -2;   // full: refuse, don't tear
+  if (store == &LittleFS && flashFree() < body.length() * 2 + 16 * 1024) return -2;   // full: refuse, don't tear
   File f = store->open(LOG_PATH, FILE_APPEND);
-  if (!f) return -1;
+  if (!f) {
+    if (store == &SD) { sdOK = false; chooseStore(); if (store) return appendEvents(body, tsOut, firstOut); }   // the card went: carry on in flash
+    return -1;
+  }
   File m;
-  bool mirror = (store == &LittleFS) && sdOK;
-  if (mirror) { m = SD.open(LOG_PATH, FILE_APPEND); if (!m) { sdOK = false; mirror = false; } }
+  bool mirror = store == &SD && flashOK && flashCopy;
+  if (mirror && flashFree() < body.length() * 2 + LOG_FLASH_KEEP) { dropFlashCopy(); mirror = false; }   // the log outgrew flash
+  if (mirror) { m = LittleFS.open(LOG_PATH, FILE_APPEND); if (!m) { flashCopy = false; mirror = false; } }
 
   tsOut = isoLocal(time(nullptr));
   firstOut = logNextSeq;
+  uint32_t off = f.size();
   int count = 0, start = 0; bool bad = false;
   while (start < (int)body.length()) {
     int nl = body.indexOf('\n', start);
@@ -561,9 +794,11 @@ int appendEvents(const String& body, String& tsOut, uint32_t& firstOut) {
     line.trim();
     line.replace("\r", " ");
     if (line.length() < 2 || line[0] != '{' || line[line.length() - 1] != '}') continue;
-    String rec = "{\"seq\":" + String(logNextSeq) + ",\"ts\":\"" + tsOut + "\",\"e\":" + line + "}\n";
+    String rec = logSeal("{\"seq\":" + String(logNextSeq) + ",\"ts\":\"" + tsOut + "\",\"e\":" + line) + "\n";
     if (f.print(rec) != rec.length()) { bad = true; break; }
     if (mirror) m.print(rec);
+    jobNote(line, off, logNextSeq);
+    off += rec.length();
     logNextSeq++;
     count++;
   }
@@ -622,8 +857,8 @@ void eeStart() {
     if (!eeRead(HB_BASE + blk * HB_SLOT, buf, sizeof buf)) { eeOK = false; return; }
     for (int i = 0; i < 16; i++) {
       HbSlot s; memcpy(&s, buf + i * HB_SLOT, HB_SLOT);
-      if (s.magic != HB_MAGIC || s.crc != crc16((uint8_t*)&s, 12)) continue;
-      if (best < 0 || s.seq > hbSeq) { best = blk + i; hbSeq = s.seq; lastAlive = s.epoch; }
+      if ((s.magic != HB_MAGIC && s.magic != HB_MAGIC_LOW) || s.crc != crc16((uint8_t*)&s, 12)) continue;
+      if (best < 0 || s.seq > hbSeq) { best = blk + i; hbSeq = s.seq; lastAlive = s.epoch; lowWoke = s.magic == HB_MAGIC_LOW; }
     }
   }
   hbNext = (best < 0) ? 0 : (best + 1) % HB_SLOTS;
@@ -632,9 +867,13 @@ void eeStart() {
 void heartbeatTick() {
   if (!eeOK || !timeValid || !outageHandled) return;   // never overwrite an outage not yet logged
   if (lastHbMs && millis() - lastHbMs < 60000UL) return;
+  heartbeatNow(false);
+}
+void heartbeatNow(bool lowOff) {
+  if (!eeOK || !timeValid || !outageHandled) return;
   lastHbMs = millis();
   HbSlot s;
-  s.seq = ++hbSeq; s.epoch = (uint32_t)time(nullptr); s.upS = millis() / 1000; s.magic = HB_MAGIC;
+  s.seq = ++hbSeq; s.epoch = (uint32_t)time(nullptr); s.upS = millis() / 1000; s.magic = lowOff ? HB_MAGIC_LOW : HB_MAGIC;
   s.crc = crc16((uint8_t*)&s, 12);
   if (eeWrite16(HB_BASE + hbNext * HB_SLOT, (uint8_t*)&s)) hbNext = (hbNext + 1) % HB_SLOTS;
 }
@@ -663,12 +902,14 @@ void outageCheck() {
   uint32_t boot = (uint32_t)time(nullptr) - millis() / 1000;
   if (boot <= lastAlive || boot - lastAlive < OUTAGE_MIN_S) return;
   const char* op = nullptr;
-  if (resetReason == ESP_RST_POWERON || resetReason == ESP_RST_BROWNOUT) op = "power.out";
+  const char* cause = resetName(resetReason);
+  if (lowWoke) { op = "power.out"; cause = "battery low"; }
+  else if (resetReason == ESP_RST_POWERON || resetReason == ESP_RST_BROWNOUT) op = "power.out";
   else if (resetReason == ESP_RST_PANIC || resetReason == ESP_RST_INT_WDT ||
            resetReason == ESP_RST_TASK_WDT || resetReason == ESP_RST_WDT) op = "hub.reset";
   if (!op) return;
   String ev = String("{\"op\":\"") + op + "\",\"from\":\"" + isoLocal(lastAlive) + "\",\"to\":\"" + isoLocal(boot) +
-              "\",\"min\":" + String((boot - lastAlive + 30) / 60) + ",\"cause\":\"" + resetName(resetReason) + "\"}";
+              "\",\"min\":" + String((boot - lastAlive + 30) / 60) + ",\"cause\":\"" + cause + "\"}";
   String ts; uint32_t first;
   appendEvents(ev, ts, first);
   Serial.println("Logged: " + ev);
@@ -946,19 +1187,81 @@ void hubSensorTick() {
 //  Battery (MAX17048 on newer Feathers, LC709203F on older ones)
 // ======================================================================
 uint8_t battType = 0;            // 0 none, 1 MAX17048, 2 LC709203F
-float battV = NAN, battPct = NAN, battRate = NAN;
+float battV = NAN, battPct = NAN, battRate = NAN;           // battV: median of the last readings; battPct: from the curve below; battRate: % per hour
 uint32_t lastBattMs = 0;
 
 void battStart() {
   if (gaugeMax.begin()) battType = 1;
   else if (gaugeLc.begin()) { battType = 2; gaugeLc.setPackSize(LC709203F_APA_2000MAH); }
 }
+uint32_t battLowSince = 0;
+bool i2cRest = false;                                     // PIN_I2C_POWER's rest level (STEMMA QT power off)
+// Battery %. The fuel gauge's own % is far off on these cells (a 4-day run from full on a 2,500 mAh LiPo:
+// the gauge read 12 % at 3.70 V with 43 % of the charge still to go, and 0 % with 5 hours left), so only its
+// voltage is used. The % comes from that run's discharge curve: % of the charge left before BATT_OFF_V, where
+// the box switches itself off, so 0 % here means "about to switch off". The run drew a steady 27 mA; the box
+// draws more, which pulls the voltage down a little and reads a few % low, never high. While charging, the
+// cell's voltage is raised by the charger and says nothing about its charge, so no % is shown then.
+const float BCURVE[][2] = { {4.15, 100.0}, {4.13, 97.4}, {4.11, 96.0}, {4.09, 94.4}, {4.07, 92.7}, {4.05, 90.8}, {4.03, 86.4}, {4.01, 82.9}, {3.99, 81.0}, {3.97, 79.1}, {3.95, 77.2}, {3.93, 74.8}, {3.91, 69.0}, {3.89, 63.3}, {3.87, 60.2}, {3.85, 57.9}, {3.83, 56.0}, {3.81, 54.1}, {3.79, 52.4}, {3.77, 50.5}, {3.75, 48.5}, {3.73, 46.6}, {3.71, 44.3}, {3.69, 41.7}, {3.67, 38.5}, {3.65, 34.7}, {3.63, 30.1}, {3.61, 25.6}, {3.59, 22.2}, {3.57, 19.2}, {3.55, 16.5}, {3.53, 14.0}, {3.51, 11.9}, {3.49, 9.9}, {3.47, 8.0}, {3.45, 6.0}, {3.43, 4.3}, {3.41, 3.1}, {3.39, 2.3}, {3.37, 1.6}, {3.35, 1.1}, {3.33, 0.6}, {3.30, 0.0} };
+const int BCURVE_N = sizeof(BCURVE) / sizeof(BCURVE[0]);
+float pctFromV(float v) {
+  if (v >= BCURVE[0][0]) return 100.0f;
+  for (int i = 1; i < BCURVE_N; i++) if (v >= BCURVE[i][0]) {
+    float v0 = BCURVE[i][0], v1 = BCURVE[i - 1][0], p0 = BCURVE[i][1], p1 = BCURVE[i - 1][1];
+    return p0 + (p1 - p0) * (v - v0) / (v1 - v0);
+  }
+  return 0.0f;
+}
+const uint8_t VB = 20;
+float vBuf[VB]; uint8_t vN = 0, vI = 0;                   // the last 20 readings (10 minutes), newest last
+float vMed(uint8_t from, uint8_t n) {                      // median of n readings, starting 'from' readings back
+  if (from >= vN) return NAN;
+  n = min<uint8_t>(n, vN - from);
+  float a[VB]; for (uint8_t i = 0; i < n; i++) a[i] = vBuf[(vI + VB - 1 - from - i) % VB];
+  std::sort(a, a + n); return n % 2 ? a[n / 2] : (a[n / 2 - 1] + a[n / 2]) / 2;
+}
+struct BSamp { uint32_t ms; float p; };
+const uint16_t BH = 361;                                  // one % reading a minute, the last 6 hours: for the rate and the time left
+BSamp bHist[BH]; uint16_t bHN = 0, bHI = 0; uint32_t bHLast = 0;
+bool battChg = false; float chgPeak = 0, battLeftH = NAN; bool battSpanOk = false;
+void battHistClear() { bHN = 0; bHI = 0; bHLast = 0; battRate = NAN; battLeftH = NAN; battSpanOk = false; }
+void battRead() {
+  float v = NAN;
+  if (battType == 1) v = gaugeMax.cellVoltage(); else if (battType == 2) v = gaugeLc.cellVoltage();
+  if (isnan(v) || v < 2.5f) { battV = v; battPct = NAN; battHistClear(); return; }   // no cell
+  vBuf[vI] = v; vI = (vI + 1) % VB; if (vN < VB) vN++;
+  // Charging: the median of the newest 3 readings 30 mV over the median of those 3 to 7 minutes before. Running
+  // down, the cell never does that (4 days of 1-minute readings: at most 14 mV); a charger lifts it 30-100 mV.
+  // Unplugged: 40 mV below the highest it reached while charging.
+  float v3 = vMed(0, 3), vOld = vMed(6, 9);
+  if (!battChg && !isnan(vOld) && v3 - vOld > 0.030f) { battChg = true; chgPeak = v3; battHistClear(); }
+  else if (battChg) { chgPeak = max(chgPeak, v3); if (v3 < chgPeak - 0.040f) { battChg = false; vBuf[0] = v; vN = 1; vI = 1; battHistClear(); } }
+  battV = vMed(0, 10);
+  battPct = battChg ? NAN : pctFromV(battV);
+  if (battChg) return;
+  // Rate: a straight line through up to the last 6 hours of readings, once there is an hour of them. On the
+  // 4-day run, an hour gave the time left within about 15 % (median), 6 hours within about 3 %; the flat
+  // stretch near 3.90 V, where the voltage hardly moves, is the hardest part.
+  uint32_t now = millis();
+  if (!bHN || now - bHLast >= 60000UL) { bHist[bHI] = { now, battPct }; bHI = (bHI + 1) % BH; if (bHN < BH) bHN++; bHLast = now; }
+  double n = 0, sx = 0, sy = 0, sxx = 0, sxy = 0; uint32_t first = now;
+  for (uint16_t i = 0; i < bHN; i++) { const BSamp& b = bHist[i]; if (now - b.ms > 6UL * 3600000UL) continue; double x = (double)(now - b.ms) / -3600000.0; n++; sx += x; sy += b.p; sxx += x * x; sxy += x * b.p; if (now - b.ms > now - first) first = b.ms; }
+  battSpanOk = n >= 3 && now - first >= 60UL * 60000UL;
+  if (!battSpanOk || n * sxx - sx * sx <= 0) { battRate = NAN; battLeftH = NAN; return; }
+  battRate = (float)((n * sxy - sx * sy) / (n * sxx - sx * sx));       // % per hour
+  battLeftH = battRate < -0.2f ? battPct / -battRate : NAN;
+}
+bool battCharging() { return battChg; }
+bool battLow() { return !isnan(battV) && battV > 2.5f && battV < BATT_OFF_V && !battCharging(); }   // under 2.5 V: no cell, or no reading
+
 void battTick() {
   if (!battType || (lastBattMs && millis() - lastBattMs < BATT_READ_S * 1000UL)) return;
   lastBattMs = millis();
-  if (battType == 1) { battV = gaugeMax.cellVoltage(); battPct = gaugeMax.cellPercent(); battRate = gaugeMax.chargeRate(); }
-  else { battV = gaugeLc.cellVoltage(); battPct = gaugeLc.cellPercent(); battRate = NAN; }
-  if (battPct > 100.0f) battPct = 100.0f;
+  battRead();
+  if (battLow() && millis() > 20000) {                     // two readings 30 s apart, both low
+    if (!battLowSince) battLowSince = millis();
+    else if (millis() - battLowSince >= 25000) lowBattOff();
+  } else battLowSince = 0;
 }
 
 // ======================================================================
@@ -970,7 +1273,7 @@ struct GpsState {
   bool fix = false;
   uint32_t lastFixMs = 0;
   double lat = 0, lon = 0;
-  float alt = NAN, hdop = NAN, kn = NAN;
+  float alt = NAN, hdop = NAN, kn = NAN, cog = NAN;   // cog: course over ground, degrees true
   uint8_t sats = 0, q = 0;
   uint32_t fixEpoch = 0;
   // track logging
@@ -986,6 +1289,11 @@ uint8_t nmeaLen = 0;
 
 bool gpsI2C = false;
 uint32_t lastGpsPoll = 0, lastGpsProbe = 0;
+// GPS power. Auto (the default): asleep while the box is on the home Wi-Fi, on everywhere else. By hand, from
+// the quick menu: On or Off until changed or the box restarts. A work trip keeps it on regardless. Asleep is
+// the PA1010D's standby (PMTK161,0); any byte on its bus wakes it, and it gets a fix again within seconds.
+uint8_t gpsMode = 0;                       // 0 auto, 1 on by hand, 2 off by hand
+bool gpsAsleep = false;
 void gpsSend(const char* body) {               // adds $ and the checksum
   uint8_t c = 0; for (const char* p = body; *p; p++) c ^= *p;
   char b[100]; snprintf(b, sizeof b, "$%s*%02X\r\n", body, c);
@@ -1064,6 +1372,7 @@ void gpsSentence(char* line) {
     gps.fix = true; gps.lastFixMs = millis();
     gps.lat = nmeaDeg(f[3], f[4]); gps.lon = nmeaDeg(f[5], f[6]);
     gps.kn = *f[7] ? atof(f[7]) : NAN;
+    gps.cog = *f[8] ? atof(f[8]) : NAN;
     const char *t = f[1], *d = f[9];
     uint32_t ep = civilEpoch(2000 + (d[4] - '0') * 10 + (d[5] - '0'), (d[2] - '0') * 10 + (d[3] - '0'), (d[0] - '0') * 10 + (d[1] - '0'),
                              (t[0] - '0') * 10 + (t[1] - '0'), (t[2] - '0') * 10 + (t[3] - '0'), (t[4] - '0') * 10 + (t[5] - '0'));
@@ -1089,6 +1398,7 @@ void gpsSentence(char* line) {
 
 // The PA1010D answers I2C reads with its NMEA stream, padded with 0x0A when it has nothing new
 void gpsTick() {
+  if (gpsAsleep) return;                   // standby: reading it would wake it
   if (!gpsI2C) { if (millis() - lastGpsProbe > 10000) gpsStart(); return; }
   if (millis() - lastGpsPoll < 80) return;
   lastGpsPoll = millis();
@@ -1199,18 +1509,22 @@ void wifiTick() {
 // ======================================================================
 //  Screen (1.5" 128x128 grayscale OLED, Adafruit 4741, SSD1327, STEMMA QT, I2C 0x3D) + knob + button
 //  + buzzer (piezo 1739)
-//  Screens: Life Logger -> Checklist -> Today -> Notes -> Trip -> Join.
+//  Screens: LIFE LOGGER (home: status lines, timers and alarms, then a menu of the other screens) and
+//    CHECKLIST, TODAY, NOTES, WORK ORDERS, JOB TIMER, EXPIRING, MAP, BUSINESS / PERSONAL CARD and JOIN,
+//    in the order picked on the dashboard (Settings > The box's screens).
 //  Knob (rotary encoder 5880, 24 clicks a turn, with a push switch):
-//    turn  = move one row per click through the checklist and today's events
-//    press = tick/untick the highlighted checklist item; on Notes, open the highlighted pinned note (turn to
-//            scroll it) and press again for the list; on the other screens: next screen. Ticking an
-//            item ticks what's nested under it, unticking unticks what it's nested under, as on the phone
-//    hold 1.5 s = screen off
-//  Button (lit): press = next screen. On the Life Logger screen, hold it and turn the knob to set the
-//    brightness (kept on the box). Its light is full while the screen is on and glows dim while asleep.
+//    turn  = move one row per click
+//    press = on LIFE LOGGER, open the screen picked in the menu; tick/untick the highlighted checklist item
+//            (it ticks what's nested under it, unticking unticks what it's nested under, as on the phone);
+//            open a note, work order or TODAY item (press again for the list); JOB TIMER: pause / stop /
+//            start the picked job or pinned project; MAP: tick Work trip, or save a spot
+//    turning while it's held is a turn, not a press; hold 1.5 s = screen off
+//  Button (lit): press = back (an open note, work order or event to its list, then LIFE LOGGER). On LIFE
+//    LOGGER, hold it and turn the knob to set the brightness (kept on the box). Its light is full while the
+//    screen is on and glows dim while asleep.
 //  The screen goes to sleep after cfg.scrOffMin minutes with nothing touched (0 = never; set from the
 //  dashboard). When it is asleep, the first turn or press only wakes it. Alarms wake it.
-//  Without the encoder: button press = next screen, hold = tick (or open / close a note); the screen still
+//  Without the encoder: button press = next screen, hold = what a knob press does; the screen still
 //  sleeps and wakes.
 //  Alarms: kitchen timers (several at once, set from the dashboard), find-my-box, and the BNWAS move
 //  reminder. While one is going, a press of the button or the knob silences it and does nothing else.
@@ -1226,9 +1540,13 @@ LbOled oled;
 const uint8_t OLED_ADDR = 0x3D;
 const uint8_t OLED_ROT  = 0;                      // 0-3: turns the picture to suit how the screen is mounted
 const uint16_t C_ON = 15, C_DIM = 5, C_OFF = 0;    // grey levels (0-15)
-const uint8_t BTN_EXT  = 11;                      // panel button (558): common to GND, NO to pin 11
-const uint8_t BTN_LED  = 18;                      // A0: panel button LED ring +, LED - to GND (dimmed with PWM)
+const uint8_t BTN_EXT  = 11;                      // BACK button (558), lower left on the lid: common to GND, NO to pin 11
+const uint8_t BTN_LED  = 18;                      // A0: BACK's LED ring +, LED - to GND (dimmed with PWM)
 const uint8_t BTN_LED_CH = 4;                     // LEDC channel for the light (0 and 1 are the buzzer's)
+const uint8_t BTN2_EXT = 9;                       // ACTION button (558), up and right of BACK: common to GND, NO to pin 9
+const uint8_t BTN2_LED = 17;                      // A1: its LED ring +, LED - to GND
+const uint8_t BTN2_LED_CH = 5;
+const uint16_t BOTH_MS = 3000;                    // hold both buttons this long: the "both" shortcut
 const uint8_t LED_DIM  = 10;                      // light while the screen sleeps (0-255)
 const uint8_t ENC_ADDRS[] = { 0x37, 0x38, 0x39 }; // encoder 5880: A0 closed = 0x37, A1 = 0x38, both = 0x39
                                                   // (0x36, all open, is the Feather's MAX17048 fuel gauge: only tried without one)
@@ -1241,19 +1559,22 @@ const uint16_t BUZ_HZ = 2650;                     // the piezo's loudest note
 const uint16_t HOLD_MS = 600;
 const int ROWS = 13;                              // text rows under the title bar
 
-enum { S_STATUS, S_CL, S_TODAY, S_NOTES, S_TRIP, S_JOIN, S_WO, S_CARD, S_COUNT };
-const char* SCR_KEY[] = { "status", "cl", "today", "notes", "map", "join", "wo", "card" };   // names in the dashboard's list
-uint8_t scrOrd[S_COUNT] = { S_STATUS, S_CL, S_TODAY, S_NOTES, S_WO, S_TRIP, S_JOIN };   // until the dashboard says otherwise
-int scrN = 7;
-std::vector<String> cardLines;                           // CARD: your business card, already fitted to 21 characters
-std::vector<uint8_t> cardLogo; int cardLogoW = 0, cardLogoH = 0;   // its logo, 4-bit grey, two pixels a byte
+enum { S_STATUS, S_CL, S_TODAY, S_NOTES, S_TRIP, S_JOIN, S_WO, S_CARD, S_JOB, S_EXP, S_PCARD, S_CLOCK, S_COUNT };
+const char* SCR_KEY[] = { "status", "cl", "today", "notes", "map", "join", "wo", "card", "job", "exp", "pcard", "clock" };   // names in the dashboard's list
+const char* SCR_MENU[] = { "", "Checklist", "Today", "Notes", "Map today", "Join (Wi-Fi)", "Work orders", "Business card", "Job timer", "Expiring", "Personal card", "Clock" };
+uint8_t scrOrd[S_COUNT] = { S_STATUS, S_CL, S_TODAY, S_NOTES, S_WO, S_JOB, S_EXP, S_TRIP, S_JOIN, S_CLOCK };   // until the dashboard says otherwise
+int scrN = 10;                                           // scrOrd[0] is always LIFE LOGGER; the rest are its menu
+struct BoxCard { std::vector<String> lines; std::vector<uint8_t> logo; int w = 0, h = 0; };
+BoxCard cards[2];                                        // BUSINESS and PERSONAL cards, already fitted to 21 characters; logo 4-bit grey, two pixels a byte
 std::vector<String> lbKeys, mapKeys;                     // the lines on LIFE LOGGER and MAP (empty: the usual ones)
+bool lbSet = false, mapSet = false;                      // the dashboard sent a list (it may be empty)
+int yOff = 0;                                            // LIFE LOGGER pushes the rows after a dividing line down a little
 String fSpd = "mph", fDist = "mi", fPos = "dd", fTemp = "F";
 uint32_t mqT0 = 0; bool mqOn = false;                     // the sliding (marquee) highlighted line
 bool oledOK = false, screenOn = false, bright = false;
 Adafruit_seesaw enc;
 bool encOK = false; uint8_t encAddr = 0;
-struct EncSw { bool down, longDone, swallow; uint32_t t0; } encSw = {};
+struct EncSw { bool down, longDone, swallow, turned; uint32_t t0; } encSw = {};
 uint32_t lastInputMs = 0;   // last turn or press, for the sleep timer
 uint8_t scr = S_STATUS;
 uint32_t lastDrawMs = 0, msgUntil = 0, ledBlinkUntil = 0, lastEncMs = 0;
@@ -1263,8 +1584,16 @@ int selMem[S_COUNT] = { 0 };
 String clSelId;   // the checklist item last highlighted
 bool redraw = true;
 
-struct Btn { uint8_t pin; bool down, held, raw, swallow; uint32_t t0, chg; };
-Btn btn = { BTN_EXT };
+struct Btn { uint8_t pin; bool down, held, raw, swallow, paired, woke; uint32_t t0, chg; };   // paired: the other button was down too; woke: its press only woke the screen
+Btn btn = { BTN_EXT }, btn2 = { BTN2_EXT };
+// the ACTION button's shortcuts (press, hold, and both buttons held), as the dashboard sets them
+String btnP = "job", btnB = "phone";
+// ACTION's quick menu: hold ACTION, turn the knob, let go to run the highlighted row. It opens on Close,
+// so letting go without turning does nothing. Which rows, in what order: Settings > The box's screen.
+std::vector<String> qmKeys = { "screen", "gps", "job", "trip", "mark", "bnwas", "phone", "clock" };
+bool qmOn = false; int qmSel = 0, qmTop = 0;
+bool bothDone = false;                                   // both held long enough: their releases do nothing else
+uint32_t findPhoneEp = 0;                                // when the box last asked the phones to sound (the dashboard polls it)
 
 // ---- checklist rows (from the same file the dashboard edits) ----
 struct ClRow { String id, text; uint8_t depth; bool done; };
@@ -1277,8 +1606,12 @@ const char* CL_PATH = "/hwo/doc/checklist.json";
 std::vector<String> todayRows;
 uint32_t todayVer = 0xFFFFFFFF;
 String todayFor, todayNote;
-struct ExpRow { String date, name; };
+std::vector<TodayEv> todayEvs;
+int todayOpen = -1, todayListSel = 0;                     // the event being read (-1: the list)
+bool todayHaveDays = false;
 std::vector<ExpRow> expRows;
+// ---- JOB TIMER: what to start (projects pinned on the dashboard, then active jobs), by id ----
+std::vector<String> jobIds, jobNames; std::vector<uint8_t> jobBill;
 // ---- pinned notes (in the same file, already wrapped to the screen's 21 characters) ----
 struct BoxNote { String title; std::vector<String> lines; };
 std::vector<BoxNote> boxNotes;
@@ -1313,6 +1646,265 @@ long dayNum(const String& d) {               // YYYY-MM-DD -> days since 1970 (c
   y -= m <= 2; long era = (y >= 0 ? y : y - 399) / 400; unsigned yoe = (unsigned)(y - era * 400);
   unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + dd - 1; unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
   return era * 146097 + (long)doe - 719468;
+}
+
+
+// ======================================================================
+//  JOB TIMER: the time entries (Clockify-style) the dashboard's Time tab keeps in the log.
+//  The box keeps the recent ones in memory: the log is read once at start-up (only the lines about time
+//  and undos from the last JOB_DAYS days), then each new line is applied as it is written. An undo
+//  re-reads just those lines. A press on the JOB TIMER screen writes the same time.set events as the
+//  dashboard's Start / Pause / Stop.
+// ======================================================================
+const int JOB_DAYS = 62;
+std::vector<TmE> tms;
+std::vector<LogMark> jobMarks;
+bool jobDirty = true;
+String jobCut;                                            // log lines dated before this aren't kept
+
+int64_t nowMs() { struct timeval tv; gettimeofday(&tv, nullptr); return (int64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000; }
+String b36(int64_t v) { String o; if (v <= 0) return "0"; while (v) { int d = v % 36; o = (char)(d < 10 ? '0' + d : 'a' + d - 10) + o; v /= 36; } return o; }
+String i64s(int64_t v) { char b[24]; snprintf(b, sizeof b, "%lld", (long long)v); return b; }
+int64_t tmParse(JsonVariantConst v) {                     // ms, or "2026-11-17T09:00" (local), or ...Z / ...-08:00
+  if (v.isNull()) return 0;
+  if (v.is<double>() || v.is<long long>()) return (int64_t)v.as<double>();
+  const char* s = v | ""; size_t n = strlen(s);
+  if (n < 10 || s[4] != '-' || s[7] != '-') return 0;
+  int y = atoi(s), mo = atoi(s + 5), d = atoi(s + 8), h = n >= 16 ? atoi(s + 11) : 0, mi = n >= 16 ? atoi(s + 14) : 0, se = n >= 19 && s[16] == ':' ? atoi(s + 17) : 0;
+  const char* z = strlen(s) > 16 ? s + 16 : "";
+  while (*z == ':' || isdigit((unsigned char)*z) || *z == '.') z++;
+  if (*z == 'Z') return (int64_t)civilEpoch(y, mo, d, h, mi, se) * 1000;
+  if (*z == '+' || *z == '-') { int oh = atoi(z + 1), om = strlen(z) >= 6 ? atoi(z + 4) : 0; int64_t off = (oh * 60 + om) * 60; return ((int64_t)civilEpoch(y, mo, d, h, mi, se) - (*z == '+' ? off : -off)) * 1000; }
+  struct tm t = {}; t.tm_year = y - 1900; t.tm_mon = mo - 1; t.tm_mday = d; t.tm_hour = h; t.tm_min = mi; t.tm_sec = se; t.tm_isdst = -1;
+  return (int64_t)mktime(&t) * 1000;
+}
+TmE* tmFind(const String& id) { for (auto& x : tms) if (x.id == id) return &x; return nullptr; }
+void jobApply(JsonObjectConst e) {                        // the same as the dashboard's time.set / time.del
+  const char* op = e["op"] | ""; String id = e["id"] | "";
+  if (!id.length()) return;
+  TmE* x = tmFind(id);
+  if (!strcmp(op, "time.del")) { if (x) x->del = true; return; }
+  if (strcmp(op, "time.set")) return;
+  if (!x) {
+    if (tms.size() >= 400) {                              // full: drop the oldest finished one
+      int k = -1; for (size_t i = 0; i < tms.size(); i++) if (tms[i].end && (k < 0 || tms[i].start < tms[k].start)) k = i;
+      if (k < 0) return; tms.erase(tms.begin() + k);
+    }
+    tms.push_back(TmE()); x = &tms.back(); x->id = id;
+  }
+  for (JsonPairConst kv : e) {
+    const char* k = kv.key().c_str(); JsonVariantConst v = kv.value();
+    if (!strcmp(k, "desc")) x->desc = fit(ascii(v | ""), 60);
+    else if (!strcmp(k, "prj")) x->prj = v | "";
+    else if (!strcmp(k, "wo")) x->wo = v | "";
+    else if (!strcmp(k, "bill")) x->bill = v | false;
+    else if (!strcmp(k, "paused")) x->paused = v | false;
+    else if (!strcmp(k, "start")) x->start = tmParse(v);
+    else if (!strcmp(k, "end")) x->end = tmParse(v);
+  }
+  x->del = false;
+}
+void jobScanStart() {
+  jobMarks.clear(); tms.clear(); jobDirty = true;
+  jobCut = timeValid ? localDate(time(nullptr) - JOB_DAYS * 86400L) : String("");
+}
+void jobScanLine(const char* head, uint32_t off) {       // {"seq":12,"ts":"2026-11-20T19:22:00-08:00","e":{"op":"time.set",...
+  bool tm = strstr(head, "\"op\":\"time.") != nullptr, un = !tm && strstr(head, "\"op\":\"undo\"") != nullptr;
+  if (!tm && !un) return;
+  const char* sq = strstr(head, "\"seq\":"); if (!sq) return;
+  const char* ts = strstr(head, "\"ts\":\"");
+  if (jobCut.length() && ts && strncmp(ts + 6, jobCut.c_str(), 10) < 0) return;   // older than JOB_DAYS
+  if (jobMarks.size() >= 4000) jobMarks.erase(jobMarks.begin());
+  jobMarks.push_back({ off, (uint32_t)strtoul(sq + 6, nullptr, 10), un });
+}
+void jobScanDone() { jobDirty = true; }
+// a new line of the log, as it is written: time entries go straight in; an undo means reading them again
+void jobNote(const String& line, uint32_t off, uint32_t seq) {
+  bool tm = line.indexOf("\"op\":\"time.") >= 0, un = !tm && line.indexOf("\"op\":\"undo\"") >= 0;
+  if (!tm && !un) return;
+  if (jobMarks.size() >= 4000) jobMarks.erase(jobMarks.begin());
+  jobMarks.push_back({ off, seq, un });
+  if (un || jobDirty) { jobDirty = true; return; }
+  JsonDocument d; if (!deserializeJson(d, line)) jobApply(d.as<JsonObjectConst>());
+  redraw = true;
+}
+void jobRebuild() {
+  jobDirty = false; tms.clear();
+  if (!store) return;
+  File f = store->open(LOG_PATH, FILE_READ); if (!f) return;
+  std::vector<uint32_t> undone;                           // newest first: an undo that was itself undone (a redo) voids nothing
+  auto isUndone = [&](uint32_t q) { for (uint32_t u : undone) if (u == q) return true; return false; };
+  for (int i = (int)jobMarks.size() - 1; i >= 0; i--) {
+    if (!jobMarks[i].undo || isUndone(jobMarks[i].seq)) continue;
+    f.seek(jobMarks[i].off); JsonDocument d;
+    if (deserializeJson(d, f)) continue;
+    for (JsonVariant q : d["e"]["seqs"].as<JsonArray>()) if (undone.size() < 2000) undone.push_back(q.as<uint32_t>());
+  }
+  for (auto& m : jobMarks) {
+    if (m.undo || isUndone(m.seq)) continue;
+    f.seek(m.off); JsonDocument d;
+    if (deserializeJson(d, f)) continue;
+    jobApply(d["e"].as<JsonObjectConst>());
+  }
+  f.close();
+}
+JobSt jobState() {
+  if (jobDirty) jobRebuild();
+  JobSt j; int ended = -1; int64_t now = nowMs();
+  time_t t = time(nullptr); struct tm tm; localtime_r(&t, &tm); tm.tm_hour = tm.tm_min = tm.tm_sec = 0; int64_t mid = (int64_t)mktime(&tm) * 1000;
+  for (int i = 0; i < (int)tms.size(); i++) {
+    const TmE& x = tms[i]; if (x.del || !x.start) continue;
+    if (!x.end) { if (j.run < 0 || x.start > tms[j.run].start) j.run = i; }
+    else if (ended < 0 || x.end > tms[ended].end) ended = i;
+    if (x.start >= mid) { int64_t e = x.end ? x.end : now; if (e > x.start) j.todayS += (uint32_t)((e - x.start) / 1000); }
+  }
+  j.pz = (j.run < 0 && ended >= 0 && tms[ended].paused) ? ended : -1;
+  j.last = j.run >= 0 ? j.run : j.pz >= 0 ? j.pz : ended;
+  return j;
+}
+String jobName(const String& id) { for (size_t i = 0; i < jobIds.size(); i++) if (jobIds[i] == id) return jobNames[i]; return id.length() ? "Job" : "No project"; }
+std::vector<JobOpt> jobOpts() {
+  JobSt j = jobState(); std::vector<JobOpt> o;
+  if (j.run >= 0) { o.push_back({ 'P', -1, "Pause" }); o.push_back({ 'S', -1, "Stop" }); }
+  else if (j.pz >= 0) { o.push_back({ 'R', -1, "Resume" }); o.push_back({ 'S', -1, "Stop" }); }
+  for (int i = 0; i < (int)jobIds.size(); i++) if (!(j.run >= 0 && tms[j.run].prj == jobIds[i])) o.push_back({ 'G', i, String(j.run >= 0 ? "Switch: " : "Start: ") + jobNames[i] });
+  if (!jobIds.size() && j.run < 0 && j.pz < 0 && j.last >= 0) o.push_back({ 'A', -1, "Start: " + (tms[j.last].desc.length() ? tms[j.last].desc : jobName(tms[j.last].prj)) });
+  return o;
+}
+void jobPress(int s) {
+  std::vector<JobOpt> O = jobOpts();
+  if (s < 0 || s >= (int)O.size()) return;
+  if (!timeValid || !store) { msg = "Clock not set"; msgUntil = millis() + 1500; redraw = true; return; }
+  JobSt j = jobState(); const JobOpt o = O[s]; int64_t t = nowMs(); String evs;
+  auto add = [&](const String& e) { evs += (evs.length() ? "\n" : "") + e; };
+  auto endRun = [&](bool pz) { add("{\"op\":\"time.set\",\"id\":" + jStr(tms[j.run].id) + ",\"end\":" + i64s(t) + (pz ? ",\"paused\":true}" : "}")); };
+  auto start = [&](const String& prj, const String& desc, bool bill, const String& wo) {
+    if (j.run >= 0) endRun(false);
+    if (j.pz >= 0) add("{\"op\":\"time.set\",\"id\":" + jStr(tms[j.pz].id) + ",\"paused\":false}");
+    add("{\"op\":\"time.set\",\"id\":\"tm-b" + b36(t) + "\",\"desc\":" + jStr(desc) + ",\"prj\":" + jStr(prj) + ",\"bill\":" + jBool(bill) + ",\"wo\":" + jStr(wo) + ",\"start\":" + i64s(t) + "}");
+  };
+  if (o.a == 'P' && j.run >= 0) endRun(true);
+  else if (o.a == 'S') { if (j.run >= 0) endRun(false); else if (j.pz >= 0) add("{\"op\":\"time.set\",\"id\":" + jStr(tms[j.pz].id) + ",\"paused\":false}"); }
+  else if ((o.a == 'R' && j.pz >= 0) || (o.a == 'A' && j.last >= 0)) { const TmE& x = tms[o.a == 'R' ? j.pz : j.last]; start(x.prj, x.desc, x.bill, x.wo); }
+  else if (o.a == 'G') {                                  // the job's or project's last description carries on; billable as the dashboard has it
+    const String& id = jobIds[o.k]; int pv = -1;
+    for (int i = 0; i < (int)tms.size(); i++) if (!tms[i].del && tms[i].start && tms[i].prj == id && (pv < 0 || tms[i].start > tms[pv].start)) pv = i;
+    String desc = pv >= 0 ? tms[pv].desc : String(""); bool bill = pv >= 0 ? tms[pv].bill : jobBill[o.k] != 0;
+    start(id, desc, bill, "");
+  }
+  if (!evs.length()) return;
+  String ts; uint32_t first;
+  if (appendEvents(evs, ts, first) > 0) { msg = o.a == 'P' ? "Paused" : o.a == 'S' ? "Stopped" : "Started"; ledBlinkUntil = millis() + 400; }
+  else msg = "Not saved";
+  msgUntil = millis() + 1000; redraw = true;
+}
+
+// ======================================================================
+//  MAP: Work trip. Tick it (in the driveway, say): from then the box adds up the distance it moves until you
+//  press End on MAP, and the trip goes to the dashboard as a business trip. A long red light doesn't end it.
+//  After an hour without moving it beeps and asks whether you're still on it (turn to Keep going or End,
+//  press); unanswered, it stops beeping after 2 minutes and keeps counting. The trip in progress is kept in
+//  flash (/hwo/trip.json), so switching the box off doesn't lose it.
+// ======================================================================
+const float TRIP_KN = 3.0f;                               // moving: faster than this (about 3.5 mph)
+const uint32_t TRIP_ASK_MS = 3600000UL, TRIP_BEEP_MS = 120000UL;
+struct WorkTrip { bool on = false, have1 = false; uint32_t t1 = 0, lastMoveEp = 0; double m = 0, lat1 = 0, lon1 = 0, pla = 0, plo = 0; };
+WorkTrip WT;
+uint32_t tripStillMs = 0, tripAskSince = 0, lastTripWatch = 0, lastTripSave = 0;
+bool tripAsk = false; int tripAskSel = 0;                 // the "still on it?" question, and Keep going (0) / End (1)
+const char* TRIP_PATH = "/hwo/trip.json";
+void tripSave() {
+  lastTripSave = millis();
+  if (!flashOK) return;
+  if (!WT.on) { LittleFS.remove(TRIP_PATH); return; }
+  File f = LittleFS.open(TRIP_PATH, FILE_WRITE); if (!f) return;
+  f.printf("{\"t1\":%lu,\"last\":%lu,\"m\":%.1f,\"have\":%d,\"lat1\":%.6f,\"lon1\":%.6f,\"la\":%.6f,\"lo\":%.6f}", (unsigned long)WT.t1, (unsigned long)WT.lastMoveEp,
+           WT.m, WT.have1 ? 1 : 0, WT.lat1, WT.lon1, WT.pla, WT.plo);
+  f.close();
+}
+void tripResume() {                                       // at start-up: a trip that was on when the box went off carries on
+  if (!flashOK || !LittleFS.exists(TRIP_PATH)) return;
+  File f = LittleFS.open(TRIP_PATH, FILE_READ); JsonDocument d; DeserializationError e = deserializeJson(d, f); f.close();
+  if (e || !(d["t1"] | 0)) { LittleFS.remove(TRIP_PATH); return; }
+  WT.on = true; WT.t1 = d["t1"]; WT.lastMoveEp = d["last"] | WT.t1; WT.m = d["m"] | 0.0; WT.have1 = (d["have"] | 0) != 0;
+  WT.lat1 = d["lat1"] | 0.0; WT.lon1 = d["lon1"] | 0.0; WT.pla = d["la"] | 0.0; WT.plo = d["lo"] | 0.0;
+  tripStillMs = millis();
+}
+bool gpsWanted() { return WT.on || gpsMode == 1 || (gpsMode == 0 && !staUp); }
+void gpsNote(bool asleep) {                // the main log keeps when the GPS slept, so the map can say why a track has a gap
+  if (!timeValid || !store) return;
+  String ev = String("{\"op\":\"gps.") + (asleep ? "sleep" : "wake") + "\",\"t\":\"" + isoLocal(time(nullptr)) + "\"" +
+              (asleep ? String(",\"why\":\"") + (gpsMode == 2 ? "hand" : "home") + "\"" : String("")) + "}";
+  String ts; uint32_t first; appendEvents(ev, ts, first);
+}
+uint32_t lastGpsPower = 0;
+void gpsPowerTick() {
+  if (millis() - lastGpsPower < 1000) return;
+  lastGpsPower = millis();
+  bool want = gpsWanted();
+  if (!want && !gpsAsleep && gpsI2C) {
+    gpsSend("PMTK161,0");
+    gpsAsleep = true; gps.fix = false; gps.newSeg = true; nmeaLen = 0;
+    gpsNote(true); redraw = true;
+  } else if (want && gpsAsleep) {
+    gpsAsleep = false;
+    Wire.beginTransmission(GPS_ADDR); Wire.write((uint8_t)' '); Wire.endTransmission();   // any byte wakes it
+    delay(20);
+    gpsStart(); gps.lastNmeaMs = millis(); gps.newSeg = true;
+    gpsNote(false); redraw = true;
+  }
+}
+void tripStart() {
+  if (!timeValid) { msg = "Clock not set"; msgUntil = millis() + 1500; redraw = true; return; }
+  WT = WorkTrip(); WT.on = true; WT.t1 = time(nullptr); WT.lastMoveEp = WT.t1;
+  tripStillMs = millis(); tripAsk = false; tripSave();
+  msg = "Work trip on"; msgUntil = millis() + 1000; redraw = true;
+}
+void tripEnd(bool atLastMove) {                           // atLastMove: ended from the "still on it?" question, so it ended when it stopped moving
+  tripAsk = false;
+  if (!WT.on) return;
+  uint32_t t2 = atLastMove ? WT.lastMoveEp : (uint32_t)time(nullptr);
+  if (!WT.have1) msg = "No GPS: not saved";
+  else {
+    String ev = "{\"op\":\"trip.set\",\"id\":\"b" + b36((int64_t)WT.t1 * 1000) + "\",\"date\":" + jStr(localDate(WT.t1)) + ",\"t1\":" + jStr(isoLocal(WT.t1)) +
+                ",\"t2\":" + jStr(isoLocal(t2)) + ",\"mi\":" + String(round(WT.m / 1609.344 * 10) / 10, 1) + ",\"gps\":true,\"src\":\"box\",\"biz\":true" +
+                ",\"lat1\":" + String(WT.lat1, 6) + ",\"lon1\":" + String(WT.lon1, 6) + ",\"lat2\":" + String(WT.pla, 6) + ",\"lon2\":" + String(WT.plo, 6) + "}";
+    String ts; uint32_t first;
+    if (store && appendEvents(ev, ts, first) == 1) { msg = "Work trip saved"; ledBlinkUntil = millis() + 400; }
+    else { msg = "Trip not saved"; msgUntil = millis() + 1500; redraw = true; return; }   // stays on, to try again
+  }
+  WT.on = false; tripSave();
+  msgUntil = millis() + 1500; redraw = true;
+}
+void tripWatch() {                                        // once a second while a work trip is on: add up the distance
+  if (!WT.on || millis() - lastTripWatch < 1000) return;
+  lastTripWatch = millis();
+  bool fresh = gps.fix && millis() - gps.lastFixMs < 5000;
+  if (fresh) {
+    if (!WT.have1) { WT.have1 = true; WT.lat1 = WT.pla = gps.lat; WT.lon1 = WT.plo = gps.lon; }
+    else {
+      double d = distM(WT.pla, WT.plo, gps.lat, gps.lon); bool mv = !isnan(gps.kn) && gps.kn >= 1.0f;
+      if ((mv && d >= 5) || d >= 50) { WT.m += d; WT.pla = gps.lat; WT.plo = gps.lon; }   // standing still, the fix wanders: that isn't distance
+    }
+    if (!isnan(gps.kn) && gps.kn >= TRIP_KN) { tripStillMs = millis(); if (timeValid) WT.lastMoveEp = time(nullptr); }
+  }
+  if (!tripAsk && millis() - tripStillMs > TRIP_ASK_MS) { tripAsk = true; tripAskSel = 0; tripAskSince = millis(); redraw = true; }
+  if (millis() - lastTripSave > 60000) tripSave();
+}
+bool tripBeeping() { return tripAsk && millis() - tripAskSince < TRIP_BEEP_MS; }
+void tripAnswer() {
+  if (tripAskSel == 1) tripEnd(true);
+  else { tripAsk = false; tripStillMs = millis(); msg = "Still on it"; msgUntil = millis() + 1000; }
+  redraw = true;
+}
+
+// ---- JOIN: the phones and computers with the dashboard open (each one checks in every few seconds) ----
+std::vector<Dev> devs;
+void devSeen(String n) {
+  n = ascii(n); n.trim(); n = n.substring(0, 24); if (!n.length()) return;
+  for (auto& d : devs) if (d.n == n) { d.ms = millis(); return; }
+  if (devs.size() >= 8) { size_t k = 0; for (size_t i = 1; i < devs.size(); i++) if (devs[i].ms < devs[k].ms) k = i; devs.erase(devs.begin() + k); }
+  devs.push_back({ n, millis() });
 }
 
 fs::FS* clFS() { return (flashOK && LittleFS.exists(CL_PATH)) ? (fs::FS*)&LittleFS : (sdOK && SD.exists(CL_PATH)) ? (fs::FS*)&SD : nullptr; }
@@ -1402,7 +1994,7 @@ void clToggle(int row) {
 void todayLoad() {
   String d = timeValid ? localDate(time(nullptr)) : String("");
   if (todayVer == docVer && todayFor == d) return;
-  todayVer = docVer; todayFor = d; todayRows.clear(); todayNote = ""; expRows.clear(); boxNotes.clear();
+  todayVer = docVer; todayFor = d; todayRows.clear(); todayEvs.clear(); todayNote = ""; expRows.clear(); boxNotes.clear();
   const char* P = "/hwo/doc/oled.json";
   fs::FS* fs = (flashOK && LittleFS.exists(P)) ? (fs::FS*)&LittleFS : (sdOK && SD.exists(P)) ? (fs::FS*)&SD : nullptr;
   if (!fs) { todayNote = d.length() ? "Open the dashboard once" : "Clock not set yet"; return; }
@@ -1410,24 +2002,42 @@ void todayLoad() {
   JsonDocument doc; DeserializationError e = deserializeJson(doc, f); f.close();
   if (e) { todayNote = "Calendar file unreadable"; return; }
   boxH12 = doc["h12"] | false;
-  if (doc["scr"].is<JsonArray>()) {
-    int n = 0;
-    for (const char* k : doc["scr"].as<JsonArray>()) for (int i = 0; i < S_COUNT && n < S_COUNT; i++) if (k && !strcmp(k, SCR_KEY[i])) scrOrd[n++] = i;
-    if (n) scrN = n;
+  if (doc["btn"].is<JsonObject>()) {
+    btnP = doc["btn"]["p"] | "job"; btnB = doc["btn"]["b"] | "phone";
+    if (doc["btn"]["q"].is<JsonArray>()) { qmKeys.clear(); for (JsonVariant v : doc["btn"]["q"].as<JsonArray>()) if (qmKeys.size() < 16) qmKeys.push_back(v.as<String>()); }
   }
-  lbKeys.clear(); mapKeys.clear(); boxWos.clear(); cardLines.clear(); cardLogo.clear(); cardLogoW = cardLogoH = 0;
-  JsonArray cl = doc["card"]["lines"];
-  for (JsonVariant l : cl) if (cardLines.size() < 12) cardLines.push_back(fit(ascii(l | ""), 21));
-  if (doc["card"]["logo"].is<JsonArray>()) {
-    int w = doc["card"]["logo"][0] | 0, h = doc["card"]["logo"][1] | 0; const char* hx = doc["card"]["logo"][2] | "";
-    if (w > 0 && w <= 128 && h > 0 && h <= 64 && (int)strlen(hx) == w * h) {
-      cardLogo.reserve(w * h / 2);
-      for (int i = 0; i + 1 < w * h; i += 2) { char b[3] = { hx[i], hx[i + 1], 0 }; cardLogo.push_back((uint8_t)strtoul(b, nullptr, 16)); }
-      cardLogoW = w; cardLogoH = h;
+  if (doc["scr"].is<JsonArray>()) {                      // LIFE LOGGER first, then the menu in the dashboard's order
+    int n = 1; scrOrd[0] = S_STATUS;
+    for (const char* k : doc["scr"].as<JsonArray>()) for (int i = 1; i < S_COUNT && n < S_COUNT; i++) if (k && !strcmp(k, SCR_KEY[i])) {
+      bool dup = false; for (int j = 0; j < n; j++) if (scrOrd[j] == i) dup = true;
+      if (!dup) scrOrd[n++] = i;
+    }
+    scrN = n;
+  }
+  lbKeys.clear(); mapKeys.clear(); boxWos.clear();
+  for (int c = 0; c < 2; c++) {                          // the business card, then the personal one
+    BoxCard& bc = cards[c]; bc = BoxCard();
+    JsonObject cj = doc[c ? "pcard" : "card"];
+    if (cj.isNull()) continue;
+    for (JsonVariant l : cj["lines"].as<JsonArray>()) if (bc.lines.size() < 13) bc.lines.push_back(fit(ascii(l | ""), 21));
+    if (cj["logo"].is<JsonArray>()) {
+      int w = cj["logo"][0] | 0, h = cj["logo"][1] | 0; const char* hx = cj["logo"][2] | "";
+      if (w > 0 && w <= 128 && h > 0 && h <= 64 && (int)strlen(hx) == w * h) {
+        bc.logo.reserve(w * h / 2);
+        for (int i = 0; i + 1 < w * h; i += 2) { char b[3] = { hx[i], hx[i + 1], 0 }; bc.logo.push_back((uint8_t)strtoul(b, nullptr, 16)); }
+        bc.w = w; bc.h = h;
+      }
     }
   }
-  for (const char* k : doc["lb"].as<JsonArray>()) if (lbKeys.size() < 12) lbKeys.push_back(k ? k : "-");
+  lbSet = doc["lb"].is<JsonArray>(); mapSet = doc["map"].is<JsonArray>();
+  for (const char* k : doc["lb"].as<JsonArray>()) if (lbKeys.size() < 12 && k && strcmp(k, "time")) lbKeys.push_back(k);   // the title bar has the time
   for (const char* k : doc["map"].as<JsonArray>()) if (mapKeys.size() < 13) mapKeys.push_back(k ? k : "-");
+  jobIds.clear(); jobNames.clear(); jobBill.clear();
+  for (JsonPair kv : doc["jobN"].as<JsonObject>()) {
+    if (jobIds.size() >= 30) break;
+    jobIds.push_back(kv.key().c_str()); jobNames.push_back(fit(ascii(kv.value() | ""), 40));
+    jobBill.push_back((int)(doc["jobB"][kv.key().c_str()] | 0) != 0);
+  }
   fSpd = doc["fmt"]["spd"] | "mph"; fDist = doc["fmt"]["dist"] | "mi"; fPos = doc["fmt"]["pos"] | "dd"; fTemp = doc["fmt"]["temp"] | "F";
   for (JsonArray x : doc["wos"].as<JsonArray>()) {
     if (boxWos.size() >= 10) break;
@@ -1448,14 +2058,19 @@ void todayLoad() {
     boxNotes.push_back(b);
   }
   if (noteOpen >= (int)boxNotes.size()) { noteOpen = -1; if (scr == S_NOTES) sel = 0; }
+  todayEvs.clear(); todayHaveDays = doc["days"].is<JsonObject>();
   if (!d.length()) { todayNote = "Clock not set yet"; return; }
   String to = doc["to"] | "";
   if (to.length() && d > to) { todayNote = "Open the dashboard to load"; return; }
   JsonArray day = doc["days"][d].as<JsonArray>();
   for (JsonArray ev : day) {
-    String t1 = ev[0] | "", t2 = ev[1] | "", ti = ascii(ev[2] | "");
-    todayRows.push_back((t1.length() ? t1 : String("all  ")) + " " + ti);     // same width as 09:00
+    if (todayEvs.size() >= 20) break;
+    TodayEv e; e.t1 = ascii(ev[0] | ""); e.t2 = ascii(ev[1] | ""); e.title = ascii(ev[2] | ""); e.label = ascii(ev[5] | "");
+    for (JsonVariant l : ev[6].as<JsonArray>()) if (e.det.size() < 40) e.det.push_back(fit(ascii(l | ""), 21));
+    todayRows.push_back((e.t1.length() ? e.t1 : String("all  ")) + " " + e.title);     // same width as 09:00
+    todayEvs.push_back(e);
   }
+  if (todayOpen >= (int)todayEvs.size()) { todayOpen = -1; if (scr == S_TODAY) sel = 0; }
   if (!todayRows.size()) todayNote = "Nothing on today";
 }
 
@@ -1543,6 +2158,8 @@ uint32_t bnLeftS(uint32_t now) {
   return 0;
 }
 
+uint32_t beepUntil = 0;
+void beepOnce() { beepUntil = millis() + 700; }
 void alarmsTick(uint32_t now) {
   for (size_t i = 0; i < timers.size();) {
     KTimer& t = timers[i];
@@ -1565,7 +2182,10 @@ void alarmsTick(uint32_t now) {
   } else if (findOn) {
     uint32_t ph = now % 1200;
     if (ph < 150) hz = BUZ_HZ; else if (ph < 300) hz = 3200;
-  }
+  } else if (tripBeeping()) {                             // "still on the work trip?": two short beeps every 3 s
+    uint32_t ph = now % 3000;
+    if (ph < 120 || (ph >= 240 && ph < 360)) hz = BUZ_HZ;
+  } else if ((int32_t)(beepUntil - now) > 0) hz = BUZ_HZ;  // the sound check
   buzSet(hz);
 }
 
@@ -1581,36 +2201,36 @@ void pushFrame() {                       // sends only the rows that changed (a 
   oled.win(y1, y2); oled.display();
   memcpy(prevFrame, b, sizeof prevFrame); frameStale = false;
 }
-void head(const char* name) {
+void head(const char* nm) {                             // the title, and the time (with seconds) and battery on the right
+  String tm5, name = nm;
+  if (timeValid) {
+    todayLoad();                                         // cached: reads the file only when it changed
+    struct tm tm; time_t t = time(nullptr); localtime_r(&t, &tm); char b[12];
+    if (boxH12) snprintf(b, sizeof b, "%d:%02d:%02d%c", tm.tm_hour % 12 ? tm.tm_hour % 12 : 12, tm.tm_min, tm.tm_sec, tm.tm_hour < 12 ? 'a' : 'p');
+    else strftime(b, sizeof b, "%H:%M:%S", &tm);
+    tm5 = b;
+  }
+  name = fit(name, max(4, 21 - (int)tm5.length() - 1));  // never let the clock run into the title
+  String r = tm5; if (battType && battChg) r += " chg"; else if (battType && !isnan(battPct)) r += " " + String((int)battPct) + "%";
+  if ((int)r.length() > 21 - (int)name.length() - 1) r = tm5;
+  if ((int)r.length() > 21 - (int)name.length() - 1) r = "";
   oled.fillRect(0, 0, 128, 9, C_ON);
   oled.setTextColor(C_OFF);
   oled.setCursor(1, 1); oled.print(name);
-  String tm5, r;
-  if (timeValid) {
-    todayLoad();                                         // cached: reads the file only when it changed
-    struct tm tm; time_t t = time(nullptr); localtime_r(&t, &tm); char b[8];
-    if (boxH12) snprintf(b, sizeof b, "%d:%02d%c", tm.tm_hour % 12 ? tm.tm_hour % 12 : 12, tm.tm_min, tm.tm_hour < 12 ? 'a' : 'p');
-    else strftime(b, sizeof b, "%H:%M", &tm);
-    tm5 = b;
-  }
-  int room = 21 - (int)strlen(name) - 1;                 // never let the clock run into the title
-  r = tm5; if (battType && !isnan(battPct)) r += " " + String((int)battPct) + "%";
-  if ((int)r.length() > room) r = tm5;
-  if ((int)r.length() > room) r = "";
   oled.setCursor(127 - 6 * r.length(), 1); oled.print(r);
   oled.setTextColor(C_ON);
 }
 void row(int i, const String& s, bool inv = false, uint16_t col = C_ON) {
-  int y = 11 + i * 9;
+  int y = 11 + i * 9 + yOff;
   if (inv) { oled.fillRect(0, y - 1, 128, 9, C_ON); oled.setTextColor(C_OFF); }
   else oled.setTextColor(col);
   oled.setCursor(1, y); oled.print(fit(s, 21));
   oled.setTextColor(C_ON);
 }
-void rowLR(int i, const String& l, const String& r, uint16_t col = C_ON) {     // left text, right-aligned value
+void rowLR(int i, const String& l, const String& r, uint16_t col = C_ON, bool inv = false) {     // left text, right-aligned value
   int room = 21 - (int)r.length() - 1;
-  row(i, fit(l, max(room, 1)), false, col);
-  oled.setTextColor(col); oled.setCursor(127 - 6 * r.length(), 11 + i * 9); oled.print(r); oled.setTextColor(C_ON);
+  row(i, fit(l, max(room, 1)), inv, col);
+  oled.setTextColor(inv ? C_OFF : col); oled.setCursor(127 - 6 * r.length(), 11 + i * 9 + yOff); oled.print(r); oled.setTextColor(C_ON);
 }
 // "In  68.4F 52%"; a reading the box hasn't heard again lately gets its age and is drawn grey
 bool tempLine(const char* name, const char* lbl, String& out) {
@@ -1682,15 +2302,17 @@ String lbLine(const String& k, uint16_t& col) {
   if (k == "time") { if (!timeValid) return "Clock not set"; if (boxH12) snprintf(b, sizeof b, "%d:%02d:%02d %cm", tm.tm_hour % 12 ? tm.tm_hour % 12 : 12, tm.tm_min, tm.tm_sec, tm.tm_hour < 12 ? 'a' : 'p'); else strftime(b, sizeof b, "%H:%M:%S", &tm); return b; }
   if (k == "net") return staUp ? "WiFi home " + String(WiFi.RSSI()) + "dBm" : "Hotspot " + String(WiFi.softAPgetStationNum()) + " connected";
   if (k == "ip") return staUp ? "IP " + WiFi.localIP().toString() : "IP " + WiFi.softAPIP().toString();
+  if (k == "gps" && gpsAsleep) return gpsMode == 2 ? String("GPS off (by hand)") : String("GPS asleep (home)");
   if (k == "gps") { bool g = gpsI2C && gps.seen && millis() - gps.lastNmeaMs < 5000; return !g ? String("GPS not found") : gps.fix ? "GPS fix " + String(gps.sats) + " sat" : "GPS no fix (" + String(gps.sats) + " sat)"; }
   if (k == "sd") return (sdOK ? String("SD ok") : String("SD none")) + "  " + String(gps.ptsDay == tripDay ? gps.ptsToday : 0) + " pts";
-  if (k == "batt") return battType && !isnan(battPct) ? "Battery " + String((int)battPct) + "% " + String(battV, 2) + "V" : String("Battery --");
+  if (k == "batt") return !battType || isnan(battV) ? String("Battery --") : battChg ? "Battery chg " + String(battV, 2) + "V" : "Battery " + String((int)battPct) + "% " + String(battV, 2) + "V";
   if (k == "volt") return !isnan(battV) ? "Battery " + String(battV, 2) + " V" : String("Battery --");
   if (k == "left") {
-    if (isnan(battRate) || isnan(battPct)) return "Time left --";
-    if (battRate > 0.5) return "Charging +" + String(battRate, 1) + "%/h";
-    if (battRate > -0.05) return "Time left: steady";
-    float h = battPct / -battRate; return "Time left ~" + (h < 48 ? String(h, h < 10 ? 1 : 0) + " h" : String(h / 24, 1) + " d");
+    if (battChg) return battV >= 4.17f ? "Battery charged" : "Battery charging";
+    if (isnan(battPct)) return "Time left --";
+    if (!battSpanOk) return "Time left: measuring";
+    if (isnan(battLeftH)) return "Time left: steady";
+    float h = battLeftH; return "Time left ~" + (h < 48 ? String(h, h < 10 ? 1 : 0) + " h" : String(h / 24, 1) + " d");
   }
   if (k == "chip") { float c = temperatureRead(); return "Box " + (fTemp == "C" ? String(c, 1) + "C" : String(c * 9 / 5 + 32, 1) + "F"); }
   if (k == "up") { uint32_t u = millis() / 1000; snprintf(b, sizeof b, "Up %lud %02lu:%02lu", (unsigned long)(u / 86400), (unsigned long)(u / 3600 % 24), (unsigned long)(u / 60 % 60)); return b; }
@@ -1700,12 +2322,14 @@ String lbLine(const String& k, uint16_t& col) {
 String mapLine(const String& k, uint16_t& col) {
   bool fresh = gps.fix && millis() - gps.lastFixMs < 5000;
   col = C_ON;
+  if (k == "cog") { bool mv = fresh && !isnan(gps.kn) && gps.kn >= 1 && !isnan(gps.cog); if (!mv) { col = C_DIM; return "COG --- (still)"; } char b[16]; snprintf(b, sizeof b, "COG %03d%cT", ((int)lroundf(gps.cog)) % 360, 248); return b; }
   if (k == "spd") { if (!fresh || isnan(gps.kn)) return "Speed --"; float v = fSpd == "kn" ? gps.kn : fSpd == "kmh" ? gps.kn * 1.852f : gps.kn * 1.15078f; return "Speed " + String(v, 1) + " " + (fSpd == "kmh" ? "km/h" : fSpd); }
   if (k == "dist") return "Dist  " + distTxt(tripDistM);
   if (k == "fix") return "Fix   " + String(tripFixS / 3600) + "h " + String((tripFixS / 60) % 60) + "m today";
   if (k == "pts") return "Points " + String(gps.ptsDay == tripDay ? gps.ptsToday : 0) + " today";
-  if (k == "spots") { col = C_DIM; return spotsToday ? "Spots " + String(spotsToday) + " - press=save" : String("Press: save spot"); }
+  if (k == "spots") { col = C_DIM; return "Spots saved " + String(spotsToday); }
   if (k == "lat" || k == "lon" || k == "sats" || k == "alt") {
+    if (gpsAsleep) return k == "lat" ? (gpsMode == 2 ? "GPS off (by hand)" : "GPS asleep (home)") : "";
     if (!gps.lastFixMs) return k == "lat" ? "No fix yet" : "";
     if (!fresh) col = C_DIM;
     if (k == "lat") return coord(gps.lat, true);
@@ -1728,39 +2352,122 @@ void alarmBox(const char* title, const String& l1, const String& l2, bool inv) {
   oled.setTextColor(C_ON);
 }
 
+// a compass rose, true north up, with an arrow along the course over ground
+void rose(int cx, int cy, int r, float cog) {
+  for (int a = 0; a < 360; a += 2) { double t = a * PI / 180; oled.drawPixel(lround(cx + r * sin(t)), lround(cy - r * cos(t)), C_DIM); }
+  for (int a = 0; a < 360; a += 30) { double t = a * PI / 180; int k = a % 90 ? 3 : 6;
+    oled.drawLine(lround(cx + (r - k) * sin(t)), lround(cy - (r - k) * cos(t)), lround(cx + r * sin(t)), lround(cy - r * cos(t)), a % 90 ? C_DIM : C_ON); }
+  oled.setTextColor(C_ON); oled.setCursor(cx - 2, cy - r + 8); oled.print('N');
+  oled.setTextColor(C_DIM); oled.setCursor(cx + r - 14, cy - 3); oled.print('E'); oled.setCursor(cx - 2, cy + r - 15); oled.print('S'); oled.setCursor(cx - r + 10, cy - 3); oled.print('W');
+  oled.setTextColor(C_ON);
+  double t = cog * PI / 180; float sn = sin(t), cs = cos(t), L = r - 9;
+  float tx = cx + L * sn, ty = cy - L * cs, bx = cx + (L - 9) * sn, by = cy - (L - 9) * cs, ax = cx - L * 0.45f * sn, ay = cy + L * 0.45f * cs;
+  oled.drawLine(lroundf(ax), lroundf(ay), lroundf(bx), lroundf(by), C_ON); oled.drawLine(lroundf(ax + cs), lroundf(ay + sn), lroundf(bx + cs), lroundf(by + sn), C_ON);
+  oled.fillTriangle(lroundf(tx), lroundf(ty), lroundf(bx + 4.5f * cs), lroundf(by + 4.5f * sn), lroundf(bx - 4.5f * cs), lroundf(by - 4.5f * sn), C_ON);
+  oled.fillRect(cx - 1, cy - 1, 3, 3, C_ON);
+}
+String hms(uint32_t s) { char b[16]; snprintf(b, sizeof b, "%lu:%02lu:%02lu", (unsigned long)(s / 3600), (unsigned long)(s / 60 % 60), (unsigned long)(s % 60)); return b; }
+// an event opened from TODAY: when, what, where, and its notes
+void todayDetail(const TodayEv& e, std::vector<String>& L) {
+  L.push_back(e.t1.length() ? e.t1 + (e.t2.length() ? " - " + e.t2 : String("")) : (e.label.length() ? e.label : String("All day")));
+  if (e.det.size()) for (auto& l : e.det) L.push_back(l); else L.push_back(e.title);
+}
+String expLine(const ExpRow& x, long dn) {               // EXPIRING: the name, and the days left on the right
+  long d = dayNum(x.date) - dn; String r = d < 0 ? String("EXPIRED") : d == 0 ? String("today") : String(d) + "d";
+  String l = fit(x.name, 21 - r.length() - 1); while ((int)l.length() < 21 - (int)r.length()) l += ' ';
+  return l + r;
+}
+int menuN() { return max(0, scrN - 1); }                // LIFE LOGGER's menu: every other screen, in the order picked
+int menuCount(int k, String& out) {                      // the number shown beside a menu line
+  out = "";
+  if (k == S_CL) { clLoad(); if (clTotal) out = String(clDoneN) + "/" + String(clTotal); }
+  else if (k == S_TODAY && todayEvs.size()) out = String(todayEvs.size());
+  else if (k == S_NOTES && boxNotes.size()) out = String(boxNotes.size());
+  else if (k == S_WO && boxWos.size()) out = String(boxWos.size());
+  else if (k == S_EXP && expRows.size()) out = String(expRows.size());
+  else if (k == S_JOB) { JobSt j = jobState(); if (j.run >= 0) out = "on"; else if (j.pz >= 0) out = "paused"; }
+  return out.length();
+}
+
+// CLOCK: the day, time and date in segment digits like a Casio watch (glyphs from tools/clock_glyphs.py, the same as the demo)
+#include "clock_glyphs.h"
+void clkGlyph(const uint8_t* px, const char* chars, uint8_t w, uint8_t h, char ch, int x, int y) {
+  const char* p = ch ? strchr(chars, ch) : nullptr; if (!p) return;
+  uint32_t o = (uint32_t)(p - chars) * w * h;
+  for (int j = 0; j < h; j++) for (int k = 0; k < w; k++) {
+    uint32_t i = o + (uint32_t)j * w + k; uint8_t b = pgm_read_byte(px + (i >> 1)), v = (i & 1) ? (b & 15) : (b >> 4);
+    if (v) oled.drawPixel(x + k, y + j, v);
+  }
+}
+void clkText(int x, int y, const String& s, uint16_t c) { oled.setTextColor(c); oled.setCursor(x, y); oled.print(s); }
+void drawClock() {
+  if (battType && (battChg || !isnan(battPct))) { String p = battChg ? String("chg") : String((int)battPct) + "%"; clkText(126 - 6 * p.length(), 5, p, C_ON); }   // the battery, top right
+  if (battType && !isnan(battV)) { String v = String(battV, 2) + "V"; clkText(126 - 6 * v.length(), 17, v, C_DIM); }
+  if (!timeValid) { clkText(28, 60, "Clock not set", C_DIM); return; }
+  time_t t = time(nullptr); struct tm tm; localtime_r(&t, &tm);
+  static const char* DOW[] = { "SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT" };
+  oled.drawRect(2, 4, 51, 27, C_DIM);                    // the day, in a box
+  for (int i = 0; i < 3; i++) clkGlyph(CLK_DAY, CLK_DAY_C, CLK_DAY_W, CLK_DAY_H, DOW[tm.tm_wday][i], 8 + i * 15, 10);
+  oled.drawFastHLine(60, 34, 67, C_DIM);
+  char hm[5]; int H = tm.tm_hour;
+  if (boxH12) { int h = H % 12 ? H % 12 : 12; hm[0] = h >= 10 ? '1' : ' '; hm[1] = '0' + h % 10; } else { hm[0] = '0' + H / 10; hm[1] = '0' + H % 10; }
+  hm[2] = '0' + tm.tm_min / 10; hm[3] = '0' + tm.tm_min % 10; hm[4] = 0;
+  const int y0 = 42; int x = 4;
+  for (int i = 0; i < 4; i++) {
+    clkGlyph(CLK_BIG, CLK_BIG_C, CLK_BIG_W, CLK_BIG_H, hm[i], x, y0); x += 20;
+    if (i == 1) { oled.fillRect(x, y0 + 9, 3, 3, C_ON); oled.fillRect(x - 1, y0 + 22, 3, 3, C_ON); x += 6; }
+  }
+  x += 2;
+  if (boxH12) clkText(x + 3, y0 + 2, H < 12 ? "A" : "P", C_ON);   // A or P above the seconds
+  clkGlyph(CLK_SEC, CLK_SEC_C, CLK_SEC_W, CLK_SEC_H, '0' + tm.tm_sec / 10, x, y0 + 13);
+  clkGlyph(CLK_SEC, CLK_SEC_C, CLK_SEC_W, CLK_SEC_H, '0' + tm.tm_sec % 10, x + 12, y0 + 13);
+  oled.drawFastHLine(2, 84, 124, C_DIM);
+  char ds[24]; snprintf(ds, sizeof ds, "%04d %02d-%02d", (tm.tm_year + 1900) % 10000, (tm.tm_mon + 1) % 100, tm.tm_mday % 100);   // 2026 11-21
+  x = 6;
+  for (const char* c = ds; *c; c++) { if (*c == ' ') { x += 7; continue; } clkGlyph(CLK_DATE, CLK_DATE_C, CLK_DATE_W, CLK_DATE_H, *c, x, 92); x += 12; }
+}
+
 void drawScreen() {
   uint32_t now = millis();
-  { int k = 0; while (k < scrN && scrOrd[k] != scr) k++; if (k == scrN) setScreen(scrOrd[0]); }
-  mqOn = false;
+  { int k = 0; while (k < scrN && scrOrd[k] != scr) k++; if (k == scrN && scr != S_CLOCK) setScreen(scrOrd[0]); }
+  mqOn = false; yOff = 0;
   oled.clearDisplay();
   oled.setTextSize(1);
-  if (scr == S_STATUS) {
+  if (qmOn) qmDraw();
+  else if (scr == S_STATUS) {
     head("LIFE LOGGER");
-    static const char* LB0[] = { "date", "net", "gps", "sd", "-", "n:Inside|In  ", "n:Outside|Out " };
-    int nL = lbKeys.size() ? (int)lbKeys.size() : 7;
-    for (int i = 0; i < nL; i++) { uint16_t c; String l = lbLine(lbKeys.size() ? lbKeys[i] : String(LB0[i]), c); row(i, l, false, c); }
-    int aRow = nL + 1;
-    // timers, BNWAS and coming expiries
     todayLoad();
-    struct L { String l, r; uint16_t c; };
+    static const char* LB0[] = { "date", "batt" };
+    int nL = lbSet ? min((int)lbKeys.size(), 8) : 2, r = nL;
+    for (int i = 0; i < nL; i++) { uint16_t c; String l = lbLine(lbSet ? lbKeys[i] : String(LB0[i]), c); row(i, l, false, c); }
+    struct L { String l, r; };                           // timers and BNWAS
     std::vector<L> al;
-    for (auto& k : timers) al.push_back({ k.name, k.ringing ? String("DONE") : clockLeft(k.left(now)), C_ON });
-    if (cfg.bnwasOn) al.push_back({ "BNWAS", bnStage ? String("PRESS") : clockLeft(bnLeftS(now)), C_ON });
-    long dn = timeValid ? dayNum(localDate(time(nullptr))) : 0;
-    for (auto& x : expRows) {
-      if (!dn || x.date.length() != 10) continue;
-      long d = dayNum(x.date) - dn;
-      al.push_back({ "Exp " + x.name, d < 0 ? String("EXPIRED") : d == 0 ? String("today") : String(d) + "d", d <= 7 ? C_ON : C_DIM });
+    for (auto& k : timers) al.push_back({ k.name, k.ringing ? String("DONE") : clockLeft(k.left(now)) });
+    if (cfg.bnwasOn) al.push_back({ "BNWAS", bnStage ? String("PRESS") : clockLeft(bnLeftS(now)) });
+    auto maxRow = [&]() { return (109 - yOff) / 9; };    // the last row that fits, highlight included
+    auto divide = [&]() { oled.drawFastHLine(0, 12 + 9 * r + yOff, 128, C_DIM); yOff += 5; };   // a little space each side of the line
+    int room = max(0, min(3, maxRow() + 1 - r - 3 - 1)); // alarms get at most 3 rows; the menu at least 3
+    if (al.size() && room) {
+      if (r) divide();
+      for (int i = 0; i < (int)al.size() && i < room; i++) {
+        if (i == room - 1 && (int)al.size() > room) { row(r + i, "+" + String(al.size() - i) + " more", false, C_DIM); break; }
+        rowLR(r + i, al[i].l, al[i].r);
+      }
+      r += min((int)al.size(), room);
     }
-    size_t room = max(1, ROWS - aRow);
-    if (al.size()) oled.drawFastHLine(0, 11 + (aRow - 1) * 9 + 3, 128, C_DIM);
-    for (size_t i = 0; i < al.size() && i < room; i++) {
-      if (i == room - 1 && al.size() > room) { row(aRow + i, "+" + String(al.size() - i) + " more", false, C_DIM); break; }
-      rowLR(aRow + i, al[i].l, al[i].r, al[i].c);
+    if (r) divide();
+    int M = menuN(), n = max(1, maxRow() + 1 - r); int& top = listTop[S_STATUS];
+    if (sel < top) top = sel; if (sel > top + n - 1) top = sel - n + 1;
+    top = constrain(top, 0, max(0, M - n));
+    for (int i = 0; i < n && top + i < M; i++) {
+      int k = scrOrd[1 + top + i]; bool on = top + i == sel; String c; menuCount(k, c);
+      rowLR(r + i, String(on ? ">" : " ") + SCR_MENU[k], c, C_ON, on);
     }
+    if (M > n) { int H = n * 9, bh = max(4, H * n / M), by = 10 + 9 * r + yOff + (H - bh) * top / (M - n); oled.drawFastVLine(127, by, bh, C_DIM); }
+    yOff = 0;
   } else if (scr == S_CL) {
     clLoad();
-    String h = "CHECKLIST " + String(clDoneN) + "/" + String(clTotal);
+    String ct = String(clDoneN) + "/" + String(clTotal), h = ("CHECKLIST " + ct).length() <= 12 ? "CHECKLIST " + ct : "LIST " + ct;
     head(h.c_str());
     if (!clRows.size()) { if (clTotal) { row(1, "All ticked"); row(2, "(ticked items hidden)", false, C_DIM); } else { row(1, "No items"); row(2, "Add them on the phone"); } }
     else {
@@ -1772,7 +2479,9 @@ void drawScreen() {
     todayLoad();
     String h = "TODAY"; if (todayFor.length()) h += " " + shortDate(todayFor);
     head(h.c_str());
-    if (!todayRows.size()) row(1, todayNote);
+    if (todayOpen >= (int)todayEvs.size()) todayOpen = -1;
+    if (todayOpen >= 0) { std::vector<String> L; todayDetail(todayEvs[todayOpen], L); drawList(L, sel, true, 0); }
+    else if (!todayRows.size()) row(1, todayNote);
     else drawList(todayRows, sel, true, 1);
   } else if (scr == S_NOTES) {
     todayLoad();
@@ -1783,50 +2492,90 @@ void drawScreen() {
       else { std::vector<String> L; for (auto& b : boxNotes) L.push_back(b.title); drawList(L, sel, true); }
     } else {
       BoxNote& b = boxNotes[noteOpen];
-      head(fit(b.title, 21).c_str());
+      head(b.title.c_str());
       int n = b.lines.size(), top = constrain(sel, 0, max(0, n - ROWS));
       for (int i = 0; i < ROWS && top + i < n; i++) row(i, b.lines[top + i]);
       if (!n) row(1, "(no text)", false, C_DIM);
       if (n > ROWS) { int H = ROWS * 9, bh = max(6, H * ROWS / n), by = 10 + (H - bh) * top / (n - ROWS); oled.drawFastVLine(127, by, bh, C_DIM); }   // where you are in it
     }
-  } else if (scr == S_TRIP) {
-    head("MAP TODAY");
-    tripLoad();
-    static const char* MP0[] = { "spd", "dist", "fix", "spots", "lat", "lon", "sats" };
-    int nM = mapKeys.size() ? (int)mapKeys.size() : 7;
-    for (int i = 0; i < nM; i++) { uint16_t c; String l = mapLine(mapKeys.size() ? mapKeys[i] : String(MP0[i]), c); row(i, l, false, c); }
-  } else if (scr == S_CARD) {
-    todayLoad();
-    if (!cardLines.size()) { head("CARD"); row(1, "No business card yet"); row(2, "Settings > Business", false, C_DIM); row(3, "on the dashboard", false, C_DIM); }
-    else {
-      int y = 2;
-      if (cardLogoW) {   // the logo, centred
-        int x0 = (128 - cardLogoW) / 2;
-        for (int j = 0; j < cardLogoH; j++) for (int i = 0; i < cardLogoW; i++) {
-          uint8_t b = cardLogo[(j * cardLogoW + i) / 2], v = (i & 1) ? (b & 15) : (b >> 4);
-          if (v) oled.drawPixel(x0 + i, y + j, v);
-        }
-        y += cardLogoH + 4;
-      }
-      int room = (128 - y) / 9;
-      for (int i = 0; i < (int)cardLines.size() && i < room; i++) {
-        const String& l = cardLines[i];
-        oled.setCursor((128 - (int)l.length() * 6) / 2, y + i * 9); oled.setTextColor(C_ON); oled.print(l);
-      }
-    }
   } else if (scr == S_WO) {
     todayLoad();
     if (woOpen >= (int)boxWos.size()) woOpen = -1;
     if (woOpen < 0) {
-      head(("WORK ORDERS " + String(boxWos.size())).c_str());
+      head("WORK ORDERS");
       if (!boxWos.size()) { row(1, "None here"); row(2, "Tick 'Show on the box'", false, C_DIM); row(3, "on a work order", false, C_DIM); }
       else { std::vector<String> L; for (auto& w : boxWos) L.push_back(w.no + " " + w.title); drawList(L, sel, true, 1); }
     } else {
       BoxWo& w = boxWos[woOpen];
-      head(fit(w.no + " " + w.title, 21).c_str());
+      head((w.no + " " + w.title).c_str());
       if (!w.lines.size()) row(1, "(no description)", false, C_DIM);
       else drawList(w.lines, sel, true, 1);
     }
+  } else if (scr == S_CLOCK) {
+    drawClock();
+  } else if (scr == S_EXP) {
+    todayLoad(); head("EXPIRING");
+    if (!expRows.size()) { row(1, "Nothing coming up"); row(2, "Expiring tab on the", false, C_DIM); row(3, "dashboard", false, C_DIM); }
+    else { long dn = timeValid ? dayNum(localDate(time(nullptr))) : 0; std::vector<String> L; for (auto& x : expRows) if (x.date.length() == 10) L.push_back(expLine(x, dn)); drawList(L, sel, true, 0); }
+  } else if (scr == S_CARD || scr == S_PCARD) {           // a card to hold up for someone: the business one, or your own
+    todayLoad();
+    BoxCard& c = cards[scr == S_CARD ? 0 : 1];
+    if (!c.lines.size()) { head(scr == S_CARD ? "BUSINESS CARD" : "PERSONAL CARD"); row(1, "Nothing to show yet"); row(2, "Settings > Business", false, C_DIM); row(3, "and Personal Info", false, C_DIM); }
+    else {
+      int y = 2;
+      if (c.w) {                                          // the logo, centred
+        int x0 = (128 - c.w) / 2;
+        for (int j = 0; j < c.h; j++) for (int i = 0; i < c.w; i++) {
+          uint8_t b = c.logo[(j * c.w + i) / 2], v = (i & 1) ? (b & 15) : (b >> 4);
+          if (v) oled.drawPixel(x0 + i, y + j, v);
+        }
+        y += c.h + 4;
+      }
+      int room = (128 - y) / 9;
+      for (int i = 0; i < (int)c.lines.size() && i < room; i++) {
+        const String& l = c.lines[i];
+        oled.setCursor((128 - (int)l.length() * 6) / 2, y + i * 9); oled.setTextColor(C_ON); oled.print(l);
+      }
+    }
+  } else if (scr == S_JOB) {
+    head("JOB TIMER");
+    todayLoad();
+    JobSt j = jobState(); int xi = j.last;
+    if (xi < 0) row(0, "Nothing timed yet", false, C_DIM);
+    else {
+      const TmE& x = tms[xi];
+      row(0, jobName(x.prj)); row(1, x.desc, false, C_DIM);
+      int64_t nw = nowMs();
+      String tt = j.run >= 0 ? hms((uint32_t)((nw - x.start) / 1000)) : j.pz >= 0 ? hms((uint32_t)((x.end - x.start) / 1000)) : String("0:00:00");
+      oled.setTextSize(2); oled.setTextColor(j.pz >= 0 && (millis() / 600) % 2 ? C_DIM : C_ON); oled.setCursor((128 - tt.length() * 12) / 2, 32); oled.print(tt); oled.setTextSize(1);
+      const char* st = j.run >= 0 ? "RUNNING" : j.pz >= 0 ? "PAUSED" : "STOPPED";
+      oled.setTextColor(j.run >= 0 ? C_ON : C_DIM); oled.setCursor((128 - strlen(st) * 6) / 2, 53); oled.print(st); oled.setTextColor(C_ON);
+      rowLR(6, "Today", hms(j.todayS), C_DIM);
+      oled.drawFastHLine(0, 12 + 9 * 7 + 3, 128, C_DIM);
+    }
+    std::vector<JobOpt> O = jobOpts();                    // the choices: five rows, scrolling with the knob
+    int top = max(0, min(sel - 2, (int)O.size() - 5));
+    if (!O.size()) { row(8, "Nothing to start yet:", false, C_DIM); row(9, "pin a project in", false, C_DIM); row(10, "Time > Projects, or", false, C_DIM); row(11, "open a job", false, C_DIM); }
+    for (int i = 0; i < 5 && top + i < (int)O.size(); i++) row(8 + i, String(top + i == sel ? "> " : "  ") + O[top + i].t, top + i == sel);
+    oled.setTextColor(C_DIM);
+    if (top > 0) { oled.setCursor(121, 11 + 9 * 8); oled.print('^'); }
+    if (top + 5 < (int)O.size()) { oled.setCursor(121, 11 + 9 * 12); oled.print('v'); }
+    oled.setTextColor(C_ON);
+  } else if (scr == S_TRIP) {
+    head("MAP TODAY");
+    tripLoad();
+    static const char* MP0[] = { "spd", "dist", "fix", "spots", "lat", "lon", "sats" };
+    std::vector<String> K; if (mapSet) K = mapKeys; else for (const char* k : MP0) K.push_back(k);
+    bool fresh = gps.fix && millis() - gps.lastFixMs < 5000, mv = fresh && !isnan(gps.kn) && gps.kn >= 1 && !isnan(gps.cog);
+    if (mv) {                                             // moving: the first lines, the course, and the compass under them
+      std::vector<String> show; for (auto& k : K) if (k != "-" && k != "cog" && show.size() < 4) show.push_back(k);
+      show.push_back("cog");
+      for (int i = 0; i < (int)show.size(); i++) { uint16_t c; String l = mapLine(show[i], c); row(i, l, false, c); }
+      int top = 11 + 9 * show.size() + 1, h = 127 - 20 - top, r = min(40, h / 2 - 1);
+      if (r > 8) rose(64, top + h / 2, r, gps.cog);
+    } else for (int i = 0; i < (int)K.size() && i < 10; i++) { uint16_t c; String l = K[i] == "-" ? String("") : mapLine(K[i], c); if (K[i] == "-") c = C_ON; row(i, l, false, c); }
+    row(11, String(sel == 0 ? "> " : "  ") + (WT.on ? "End trip " + distTxt(WT.m) : String("[ ] Work trip")), sel == 0);   // turn to pick, press to start / end or save
+    row(12, String(sel == 1 ? "> " : "  ") + "Save spot here", sel == 1);
   } else {
     head("JOIN");
     row(0, "WiFi " + ascii(cfg.apSsid));
@@ -1834,45 +2583,70 @@ void drawScreen() {
     row(3, "Open " + String(MDNS_NAME) + ".local");
     row(4, "  or " + WiFi.softAPIP().toString());
     row(6, staUp ? "Home: " + WiFi.localIP().toString() : String("Home WiFi: not here"));
+    std::vector<Dev> dv; for (auto& d : devs) if (millis() - d.ms < 600000UL) dv.push_back(d);   // dashboards open in the last 10 minutes, newest first
+    for (size_t i = 1; i < dv.size(); i++) for (size_t k = i; k > 0 && dv[k].ms > dv[k - 1].ms; k--) std::swap(dv[k], dv[k - 1]);
+    oled.drawFastHLine(0, 12 + 9 * 7 + 3, 128, C_DIM);
+    row(8, "CONNECTED " + String(dv.size()), false, C_DIM);
+    if (!dv.size()) row(9, "No dashboard open", false, C_DIM);
+    for (int i = 0; i < (int)dv.size() && i < (dv.size() > 4 ? 3 : 4); i++) { uint32_t ag = (millis() - dv[i].ms) / 1000; rowLR(9 + i, dv[i].n, ag < 60 ? String("now") : String(ag / 60) + "m"); }
+    if (dv.size() > 4) row(12, "+" + String(dv.size() - 3) + " more", false, C_DIM);
   }
   // alarms on top of whatever screen is up
   bool blink = (now / 500) % 2;
-  if (bnStage == 1) alarmBox("BNWAS", "Press the button", "alarm in " + String(bnLeftS(now)) + " s", blink);
-  else if (bnStage == 2) alarmBox("BNWAS", "Press the button", "", blink);
+  if (bnStage == 1) alarmBox("BNWAS", "Press a button", "alarm in " + String(bnLeftS(now)) + " s", blink);
+  else if (bnStage == 2) alarmBox("BNWAS", "Press a button", "", blink);
   else if (timerRinging()) { String n; for (auto& k : timers) if (k.ringing) { n = k.name; break; } alarmBox("TIMER", n, "Press to stop", blink); }
   else if (findOn) alarmBox("HERE", "Find my box", "Press to stop", blink);
+  else if (tripAsk) {                                     // still on the work trip? turn to pick, press
+    oled.fillRect(0, 26, 128, 78, C_OFF); oled.drawRect(0, 26, 128, 78, C_ON); oled.drawRect(2, 28, 124, 74, C_ON);
+    oled.setTextSize(2); oled.setTextColor(C_ON); oled.setCursor(64 - 6 * 9, 33); oled.print("WORK TRIP"); oled.setTextSize(1);
+    String q = "Still on it? " + distTxt(WT.m); if (q.length() > 20) { int k = q.lastIndexOf(' '); q.remove(k, 1); } q = fit(q, 20); oled.setCursor(64 - 3 * q.length(), 53); oled.print(q);
+    const char* O[] = { "Keep going", "End trip" };
+    for (int i = 0; i < 2; i++) {
+      int y = 68 + i * 13; bool on = i == tripAskSel;
+      if (on) oled.fillRect(8, y - 2, 112, 11, C_ON);
+      oled.setTextColor(on ? C_OFF : C_ON); oled.setCursor(64 - 3 * strlen(O[i]), y); oled.print(O[i]);
+    }
+    oled.setTextColor(C_ON);
+  }
   else if (millis() < msgUntil) { oled.fillRect(14, 50, 100, 26, C_OFF); oled.drawRect(14, 50, 100, 26, C_ON); oled.setCursor(64 - 3 * msg.length(), 59); oled.print(msg); }
   pushFrame();
 }
 
 int listLen() {
+  if (scr == S_STATUS) return menuN();
   if (scr == S_CL) { clLoad(); return clRows.size(); }
-  if (scr == S_TODAY) { todayLoad(); return todayRows.size(); }
+  if (scr == S_TODAY) { todayLoad(); if (todayOpen >= (int)todayEvs.size()) todayOpen = -1; if (todayOpen >= 0) { std::vector<String> L; todayDetail(todayEvs[todayOpen], L); return L.size(); } return todayRows.size(); }
   if (scr == S_NOTES) { todayLoad(); if (noteOpen >= (int)boxNotes.size()) noteOpen = -1; return noteOpen >= 0 ? max(1, (int)boxNotes[noteOpen].lines.size() - ROWS + 1) : (int)boxNotes.size(); }   // reading: one step per line
   if (scr == S_WO) { todayLoad(); if (woOpen >= (int)boxWos.size()) woOpen = -1; return woOpen >= 0 ? (int)boxWos[woOpen].lines.size() : (int)boxWos.size(); }
+  if (scr == S_EXP) { todayLoad(); return expRows.size(); }
+  if (scr == S_JOB) { todayLoad(); return jobOpts().size(); }
+  if (scr == S_TRIP) return 2;
   return 0;
 }
 void setScreen(int s) {   // each screen comes back where you left it
   if (scr == S_NOTES && noteOpen >= 0) { noteOpen = -1; sel = noteListSel; }   // leaving a note goes back to the list
   if (scr == S_WO && woOpen >= 0) { woOpen = -1; sel = woListSel; }
+  if (scr == S_TODAY && todayOpen >= 0) { todayOpen = -1; sel = todayListSel; }
   selMem[scr] = sel;
   scr = constrain(s, 0, S_COUNT - 1); mqT0 = millis();
   int n = listLen();
+  if (scr == S_CL && clSelId.length()) for (size_t i = 0; i < clRows.size(); i++) if (clRows[i].id == clSelId) { selMem[S_CL] = i; break; }
   sel = constrain(selMem[scr], 0, max(0, n - 1));
   redraw = true;
 }
-void nextScreen() {
+void nextScreen() {       // without the knob: the button goes round the screens
   int k = 0; while (k < scrN && scrOrd[k] != scr) k++;
   setScreen(scrOrd[k < scrN ? (k + 1) % scrN : 0]);
 }
 void moveSel(int d) {   // one row per click of the knob, stopping at the ends
+  if (tripAsk) { tripAskSel = constrain(tripAskSel + d, 0, 1); redraw = true; return; }
   int n = listLen(); if (n <= 0) { sel = 0; return; }
   int s2 = constrain(sel + d, 0, n - 1);
   if (s2 != sel) { sel = s2; redraw = true; mqT0 = millis(); }
   selMem[scr] = sel;
   if (scr == S_CL && sel < (int)clRows.size()) clSelId = clRows[sel].id;
 }
-
 void input() { redraw = true; }
 void screenPower(bool on) {
   on = on && oledOK;
@@ -1887,21 +2661,120 @@ bool touched(uint32_t now) {
   lastInputMs = now; input();
   if (cfg.bnwasOn) bnwasRestart(now);
   if (alarmActive()) { silence(true, now); msg = "Stopped"; msgUntil = now + 1000; return true; }
+  if (tripBeeping()) { tripAskSince = millis() - TRIP_BEEP_MS; if (!screenOn) screenPower(true); redraw = true; return true; }   // the first touch only stops the beeping
   if (!screenOn && oledOK) { screenPower(true); return true; }
   return false;
 }
-void onShort() { if (screenOn) nextScreen(); }
+void todayPress() {   // TODAY: press opens the highlighted event (when, where, notes), press again goes back
+  todayLoad();
+  if (todayOpen >= (int)todayEvs.size()) todayOpen = -1;
+  if (todayOpen < 0) { if (!todayEvs.size()) return; todayListSel = sel; todayOpen = constrain(sel, 0, (int)todayEvs.size() - 1); sel = 0; listTop[S_TODAY] = 0; }
+  else { todayOpen = -1; sel = todayListSel; }
+  selMem[S_TODAY] = sel; mqT0 = millis(); redraw = true;
+}
+// the button: back one step (an open note, work order or TODAY item to its list), then to LIFE LOGGER
+void back() {
+  if (scr == S_NOTES && noteOpen >= 0) { notesPress(); return; }
+  if (scr == S_WO && woOpen >= 0) { woPress(); return; }
+  if (scr == S_TODAY && todayOpen >= 0) { todayPress(); return; }
+  if (scr == S_STATUS) return;
+  int from = scr; setScreen(S_STATUS);
+  for (int k = 1; k < scrN; k++) if (scrOrd[k] == from) { sel = k - 1; selMem[S_STATUS] = sel; break; }
+}
+void mapPress() {
+  if (sel == 0) { if (WT.on) tripEnd(false); else tripStart(); }
+  else spotSave();
+}
+// the knob's press: on LIFE LOGGER it opens the screen picked in the menu; it never moves between screens otherwise
+void press() {
+  if (tripAsk) { tripAnswer(); return; }
+  if (scr == S_STATUS) { if (sel >= 0 && sel < menuN()) setScreen(scrOrd[1 + sel]); }
+  else if (scr == S_CL) clToggle(sel); else if (scr == S_NOTES) notesPress(); else if (scr == S_WO) woPress();
+  else if (scr == S_TODAY) todayPress(); else if (scr == S_TRIP) mapPress(); else if (scr == S_JOB) jobPress(sel);
+  redraw = true;
+}
+void onShort() { if (!screenOn) return; if (encOK) back(); else nextScreen(); }
+// the ACTION button's shortcuts: home, clock, job timer, quick mark, work trip, screen off, find my phone, sound check, restart
+void jobQuick() {                                        // pause what's running, resume what's paused, else start the last one
+  std::vector<JobOpt> O = jobOpts(); int k = -1;
+  for (const char a : { 'P', 'R', 'A', 'G' }) { for (int i = 0; i < (int)O.size() && k < 0; i++) if (O[i].a == a) k = i; if (k >= 0) break; }
+  if (k < 0) { msg = "No job to start"; msgUntil = millis() + 1500; redraw = true; return; }
+  jobPress(k);
+}
+struct QmRow { String t, a; };
+String jobQuickLabel() {
+  std::vector<JobOpt> O = jobOpts(); JobSt j = jobState();
+  auto nm = [&](int i) { return tms[i].desc.length() ? tms[i].desc : jobName(tms[i].prj); };
+  for (const JobOpt& o : O) if (o.a == 'P') return "Pause " + nm(j.run);
+  for (const JobOpt& o : O) if (o.a == 'R') return "Resume " + nm(j.pz);
+  for (const JobOpt& o : O) if (o.a == 'A' || o.a == 'G') return o.t;
+  return "";
+}
+std::vector<QmRow> qmRows() {
+  std::vector<QmRow> r; r.push_back({ "Close", "" });
+  for (const String& k : qmKeys) {
+    if (k == "screen") r.push_back({ "Screen off", "off" });
+    else if (k == "gps") {
+      if (gpsAsleep) r.push_back({ "GPS on", "gps1" }); else r.push_back({ "GPS off", "gps2" });
+      if (gpsMode) r.push_back({ "GPS auto (home off)", "gps0" });
+    }
+    else if (k == "job") { String t = jobQuickLabel(); if (t.length()) r.push_back({ t, "job" }); }
+    else if (k == "trip") r.push_back({ WT.on ? "End work trip" : "Start work trip", "trip" });
+    else if (k == "mark") r.push_back({ "Quick mark", "mark" });
+    else if (k == "bnwas") r.push_back({ cfg.bnwasOn ? "BNWAS off" : "BNWAS on", "bnwas" });
+    else if (k == "phone") r.push_back({ "Find my phone", "phone" });
+    else if (k == "clock") r.push_back({ "Clock", "clock" });
+    else if (k == "home") r.push_back({ "Home", "home" });
+    else if (k == "beep") r.push_back({ "Sound check", "beep" });
+    else if (k == "restart") r.push_back({ "Restart", "restart" });
+  }
+  return r;
+}
+void qmDraw() {
+  std::vector<QmRow> R = qmRows();
+  qmSel = constrain(qmSel, 0, (int)R.size() - 1);
+  head("QUICK MENU");
+  const int vis = 12;
+  if (qmSel < qmTop) qmTop = qmSel; if (qmSel >= qmTop + vis) qmTop = qmSel - vis + 1;
+  for (int i = 0; i < vis && qmTop + i < (int)R.size(); i++) { int k = qmTop + i; row(i, (k == qmSel ? "> " : "  ") + R[k].t, k == qmSel, k ? C_ON : C_DIM); }
+}
+void qmRun() {
+  std::vector<QmRow> R = qmRows();
+  qmOn = false; redraw = true;
+  if (qmSel <= 0 || qmSel >= (int)R.size()) return;        // Close
+  const String a = R[qmSel].a;
+  if (a.startsWith("gps")) {
+    gpsMode = a[3] - '0'; lastGpsPower = 0;
+    msg = gpsMode == 1 ? "GPS on" : gpsMode == 2 ? "GPS off" : (staUp ? "GPS auto: asleep" : "GPS auto: on"); msgUntil = millis() + 1500;
+  } else if (a == "bnwas") {
+    cfg.bnwasOn = !cfg.bnwasOn; bnwasRestart(millis()); if (flashOK) cfgSave();
+    msg = cfg.bnwasOn ? "BNWAS on" : "BNWAS off"; msgUntil = millis() + 1500;
+  } else shortcut(a);
+}
+void shortcut(const String& k) {
+  if (!screenOn && k != "phone" && k != "beep" && k != "restart") screenPower(true);
+  if (k == "home") { setScreen(S_STATUS); }
+  else if (k == "clock") { setScreen(S_CLOCK); }
+  else if (k == "job") jobQuick();
+  else if (k == "mark") spotSave();
+  else if (k == "trip") { if (WT.on) tripEnd(false); else tripStart(); }
+  else if (k == "off") screenPower(false);
+  else if (k == "phone") { findPhoneEp = time(nullptr); msg = "Calling phones"; msgUntil = millis() + 2000; ledBlinkUntil = millis() + 1200; }
+  else if (k == "beep") { beepOnce(); msg = "Sound check"; msgUntil = millis() + 1200; }
+  else if (k == "restart") { msg = "Restarting"; msgUntil = millis() + 2000; redraw = true; drawScreen(); delay(600); ESP.restart(); }
+  redraw = true;
+}
 void woPress() {   // WORK ORDERS: press opens one (description, then steps), press again goes back
   todayLoad();
   if (woOpen >= (int)boxWos.size()) woOpen = -1;
-  if (woOpen < 0) { if (!boxWos.size()) { nextScreen(); return; } woListSel = sel; woOpen = constrain(sel, 0, (int)boxWos.size() - 1); sel = 0; listTop[S_WO] = 0; }
+  if (woOpen < 0) { if (!boxWos.size()) return; woListSel = sel; woOpen = constrain(sel, 0, (int)boxWos.size() - 1); sel = 0; listTop[S_WO] = 0; }
   else { woOpen = -1; sel = woListSel; }
   selMem[S_WO] = sel; mqT0 = millis(); redraw = true;
 }
 // MAP: a press saves where the box is now, as a spot on the dashboard's Map tab
 void spotSave() {
   bool fresh = gps.fix && millis() - gps.lastFixMs < 5000;
-  if (!fresh) { msg = "No GPS fix"; msgUntil = millis() + 1500; redraw = true; return; }
+  if (!fresh) { msg = gpsAsleep ? (gpsMode == 2 ? "GPS is off" : "GPS asleep at home") : "No GPS fix"; msgUntil = millis() + 1500; redraw = true; return; }
   if (!timeValid || !store) { msg = "Not saved"; msgUntil = millis() + 1500; redraw = true; return; }
   uint32_t t = time(nullptr);
   String ev = "{\"op\":\"spot.add\",\"id\":\"sp-" + String(t, HEX) + String(millis() % 1000) + "\",\"lat\":" + String(gps.lat, 6) + ",\"lon\":" + String(gps.lon, 6) +
@@ -1915,13 +2788,13 @@ void spotSave() {
 void notesPress() {
   todayLoad();
   if (noteOpen >= (int)boxNotes.size()) noteOpen = -1;
-  if (noteOpen < 0) { if (!boxNotes.size()) { nextScreen(); return; } noteListSel = sel; noteOpen = constrain(sel, 0, (int)boxNotes.size() - 1); sel = 0; }
+  if (noteOpen < 0) { if (!boxNotes.size()) return; noteListSel = sel; noteOpen = constrain(sel, 0, (int)boxNotes.size() - 1); sel = 0; }
   else { noteOpen = -1; sel = noteListSel; }
   selMem[S_NOTES] = sel; redraw = true;
 }
-void onHold() {   // without the encoder, hold the button to tick (checklist) or open / close a note
+void onHold() {   // without the encoder, hold the button: what a knob press does
   if (!screenOn || encOK) return;
-  if (scr == S_CL) clToggle(sel); else if (scr == S_NOTES) notesPress(); else if (scr == S_TRIP) spotSave(); else if (scr == S_WO) woPress();
+  if (scr != S_STATUS) press();
 }
 
 void encStart() {
@@ -1935,9 +2808,10 @@ void encStart() {
 }
 
 void screenStart() {
-  pinMode(BTN_EXT, INPUT_PULLUP);
+  pinMode(BTN_EXT, INPUT_PULLUP); pinMode(BTN2_EXT, INPUT_PULLUP);
   buzStart();                                              // claims LEDC channels 0 and 1 first
   ledcAttachChannel(BTN_LED, 5000, 8, BTN_LED_CH); ledcWrite(BTN_LED, 0);
+  ledcAttachChannel(BTN2_LED, 5000, 8, BTN2_LED_CH); ledcWrite(BTN2_LED, 0);
   bnwasRestart(millis());
   oledOK = oled.begin(OLED_ADDR, true);
   encStart();
@@ -1959,21 +2833,21 @@ void encTick(uint32_t now) {
   bool d = !enc.digitalRead(ENC_SW);
   if (d != encSw.down) {
     encSw.down = d;
-    if (d) { encSw.t0 = now; encSw.longDone = false; encSw.swallow = touched(now); }
+    if (d) { encSw.t0 = now; encSw.longDone = false; encSw.turned = false; encSw.swallow = touched(now); }
     else {
-      if (!encSw.swallow && !encSw.longDone && screenOn) {
-        if (scr == S_CL) clToggle(sel); else if (scr == S_NOTES) notesPress(); else if (scr == S_TRIP) spotSave(); else if (scr == S_WO) woPress(); else nextScreen();
-      }
+      if (!encSw.swallow && !encSw.longDone && !encSw.turned && screenOn && !qmOn) press();
       encSw.swallow = false;
     }
   }
-  if (encSw.down && !encSw.swallow && !encSw.longDone && now - encSw.t0 >= ENC_OFF_MS) { encSw.longDone = true; screenPower(false); }
+  if (encSw.down && !encSw.swallow && !encSw.longDone && !encSw.turned && !qmOn && now - encSw.t0 >= ENC_OFF_MS) { encSw.longDone = true; screenPower(false); }
   // turning
   int32_t delta = enc.getEncoderDelta();
   if (!delta) return;
   if (ENC_REVERSE) delta = -delta;
+  if (encSw.down) encSw.turned = true;
+  if (qmOn) { qmSel = constrain(qmSel + (int)delta, 0, (int)qmRows().size() - 1); lastInputMs = now; redraw = true; return; }
   if (touched(now)) return;                                // that click woke the screen (or stopped an alarm)
-  if (scr == S_STATUS && btn.down && !btn.swallow) {       // holding the button: the knob sets brightness
+  if (btn.down && !btn.swallow) {                          // holding BACK: the knob sets the screen's brightness
     bright = true; btn.held = true;
     cfg.contrast = constrain(cfg.contrast + (int)delta * 8, 1, 255); oled.setContrast(cfg.contrast);
     msg = "Bright " + String((int)lroundf(cfg.contrast * 100.0f / 255)) + "%"; msgUntil = now + 1500;
@@ -1983,29 +2857,56 @@ void encTick(uint32_t now) {
 void screenTick() {
   uint32_t now = millis();
   if (timeValid && now - lastTripCheck > 5000) { lastTripCheck = now; tripLoad(); }   // today's distance from the file, once
+  tripWatch();
   alarmsTick(now);
-  // button
+  // BACK
   bool raw = digitalRead(btn.pin) == LOW;
   if (raw != btn.raw) { btn.raw = raw; btn.chg = now; }
   if (now - btn.chg > 25 && raw != btn.down) {
     btn.down = raw;
-    if (raw) { btn.t0 = now; btn.held = false; btn.swallow = touched(now); }
+    if (raw) { btn.t0 = now; btn.held = false; btn.paired = btn2.down; if (btn2.down) btn2.paired = true; btn.swallow = touched(now); }
     else {
       if (btn.swallow) btn.swallow = false;
       else if (bright) { bright = false; cfgSave(); msg = "Saved"; msgUntil = now + 800; redraw = true; }
-      else if (!btn.held) onShort();
+      else if (!btn.held && !btn.paired && !bothDone) onShort();
+      if (!btn2.down) bothDone = false;
     }
   }
-  if (btn.down && !btn.held && !btn.swallow && now - btn.t0 >= HOLD_MS) { btn.held = true; onHold(); }
+  if (btn.down && !btn.held && !btn.swallow && !btn2.down && now - btn.t0 >= HOLD_MS) { btn.held = true; onHold(); }
+  // ACTION: a press runs its shortcut; a hold opens the quick menu (let go to run the highlighted row)
+  bool raw2 = digitalRead(btn2.pin) == LOW;
+  if (raw2 != btn2.raw) { btn2.raw = raw2; btn2.chg = now; }
+  if (now - btn2.chg > 25 && raw2 != btn2.down) {
+    btn2.down = raw2;
+    if (raw2) {
+      btn2.t0 = now; btn2.held = false; btn2.paired = btn.down; if (btn.down) btn.paired = true;
+      bool wasOff = !screenOn && oledOK && !alarmActive() && !tripBeeping();
+      btn2.swallow = touched(now);
+      btn2.woke = btn2.swallow && wasOff;                  // this press only woke the screen: a hold still opens the menu
+    }
+    else {
+      if (qmOn) { if (!btn.down && !bothDone) qmRun(); else { qmOn = false; redraw = true; } }
+      else if (btn2.swallow) {}
+      else if (!btn2.held && !btn2.paired && !bothDone) shortcut(btnP);
+      btn2.swallow = false;
+      if (!btn.down) bothDone = false;
+    }
+  }
+  if (btn2.down && !btn2.held && (!btn2.swallow || btn2.woke) && !btn.down && now - btn2.t0 >= HOLD_MS) {
+    btn2.held = true; qmOn = true; qmSel = 0; qmTop = 0; lastInputMs = now; redraw = true;
+  }
+  if (qmOn && btn.down) { qmOn = false; redraw = true; }    // BACK while the menu is open: close it, run nothing
+  // both held: the third shortcut, once
+  if (btn.down && btn2.down && !bothDone && now - max(btn.t0, btn2.t0) >= BOTH_MS) { bothDone = true; btn.held = btn2.held = true; btn.swallow = btn2.swallow = false; shortcut(btnB); }
   encTick(now);
   // alarms wake the screen; otherwise it sleeps after cfg.scrOffMin minutes untouched
-  if (alarmActive()) { if (!screenOn) screenPower(true); lastInputMs = now; }
+  if (alarmActive() || tripBeeping()) { if (!screenOn) screenPower(true); lastInputMs = now; }
   else if (screenOn && cfg.scrOffMin > 0 && now - lastInputMs > (uint32_t)cfg.scrOffMin * 60000UL) screenPower(false);
   // button light: full with the screen on, dim while it sleeps; blinks on a tick; flashes during an alarm
   uint8_t led = screenOn ? 255 : (oledOK ? LED_DIM : 0);
-  if (alarmActive()) led = (now / (bnStage == 1 ? 500 : 150)) % 2 ? 255 : 0;
+  if (alarmActive() || tripBeeping()) led = (now / (bnStage == 1 ? 500 : 150)) % 2 ? 255 : 0;
   else if (now < ledBlinkUntil) led = (now / 100) % 2 ? 255 : 0;
-  ledcWrite(BTN_LED, led);
+  ledcWrite(BTN_LED, led); ledcWrite(BTN2_LED, led);
   if (!screenOn) return;
   if (redraw || now - lastDrawMs > (alarmActive() ? 250u : mqOn ? 30u : 1000u)) { drawScreen(); lastDrawMs = now; redraw = false; }
 }
@@ -2089,7 +2990,9 @@ void sendErr(int code, const char* msg) {
   server.send(code, "application/json", String("{\"ok\":false,\"err\":") + jStr(msg) + "}");
 }
 
-const char UPDATE_HTML[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8">
+// update page, gzipped to save room in flash. Its source, to change it (then gzip -9 it into the bytes below):
+/*
+<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Life Logger update</title>
 <style>body{font:15px system-ui;margin:40px auto;max-width:480px;padding:0 16px;background:#14171c;color:#e6e8eb}
 input,button{font:inherit;margin:6px 0;padding:8px;width:100%;box-sizing:border-box}
@@ -2103,9 +3006,51 @@ const fd=new FormData();fd.append('firmware',f);const x=new XMLHttpRequest();
 x.open('POST','/update?pw='+encodeURIComponent(document.getElementById('pw').value));
 x.upload.onprogress=e=>{document.getElementById('m').textContent=Math.round(100*e.loaded/e.total)+'%'};
 x.onload=()=>{document.getElementById('m').textContent=x.responseText;if(x.status==200)setTimeout(()=>location.href='/',20000)};
-x.send(fd)}</script></body></html>)HTML";
+x.send(fd)}</script></body></html>
+*/
+const uint8_t UPDATE_HTML_GZ[] PROGMEM = {
+  0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x95, 0x54, 0x4d, 0x6f, 0xdc, 0x36, 0x10, 0xbd, 0xef, 0xaf, 0x60, 0x64, 0x04, 0x92,
+  0xea, 0x5d, 0x49, 0x6b, 0x3b, 0xee, 0x56, 0x5f, 0x05, 0x92, 0xb6, 0xa8, 0x01, 0x07, 0x0d, 0x52, 0x07, 0x28, 0x50, 0xf4, 0x40, 0x91, 0xa3, 0x15,
+  0x61, 0x89, 0x64, 0x48, 0xca, 0xbb, 0x5b, 0x63, 0xff, 0x7b, 0x87, 0x92, 0x9c, 0xf4, 0xd0, 0x1c, 0x7a, 0xd9, 0x95, 0xe6, 0xe3, 0xcd, 0x9b, 0x37,
+  0x33, 0x2a, 0x5f, 0x71, 0xc5, 0xdc, 0x49, 0x03, 0xe9, 0xdc, 0xd0, 0xd7, 0xe5, 0xf2, 0x0b, 0x94, 0xd7, 0xe5, 0x00, 0x8e, 0x12, 0xd6, 0x51, 0x63,
+  0xc1, 0x55, 0xc1, 0xe8, 0xda, 0xcd, 0x2e, 0xa8, 0x57, 0xb3, 0x59, 0xd2, 0x01, 0xaa, 0xe0, 0x49, 0xc0, 0x41, 0x2b, 0xe3, 0x02, 0xc2, 0x94, 0x74,
+  0x20, 0x31, 0xec, 0x20, 0xb8, 0xeb, 0x2a, 0x0e, 0x4f, 0x82, 0xc1, 0x66, 0x7a, 0x59, 0x0b, 0x29, 0x9c, 0xa0, 0xfd, 0xc6, 0x32, 0xda, 0x43, 0xb5,
+  0x0d, 0xea, 0xd2, 0x09, 0xd7, 0x43, 0x7d, 0x2f, 0x5a, 0x20, 0xf7, 0x6a, 0xbf, 0x07, 0x43, 0x46, 0xcd, 0xa9, 0x83, 0x32, 0x9d, 0x3d, 0xab, 0xd2,
+  0xba, 0x13, 0xfe, 0x37, 0x8a, 0x9f, 0x9e, 0x5b, 0x84, 0xce, 0xb7, 0x6f, 0xf4, 0x91, 0xd8, 0x93, 0x75, 0x30, 0x6c, 0x46, 0x51, 0x0c, 0xd4, 0xec,
+  0x85, 0xcc, 0x6f, 0x32, 0xb4, 0xd2, 0xd1, 0x29, 0x34, 0x1c, 0xe7, 0x6a, 0xf9, 0xcd, 0x0e, 0x8d, 0x85, 0xa6, 0x9c, 0x0b, 0xb9, 0xcf, 0x33, 0xb2,
+  0xbd, 0xc5, 0xd7, 0x86, 0xb2, 0xc7, 0xbd, 0x51, 0xa3, 0xe4, 0xf9, 0xc5, 0xf6, 0x66, 0xfb, 0xfd, 0x96, 0x15, 0x4c, 0xf5, 0xca, 0xe4, 0x17, 0x70,
+  0x0b, 0x3b, 0x68, 0xce, 0x2b, 0x21, 0xf5, 0xe8, 0xd6, 0xcd, 0xe8, 0x9c, 0x92, 0x73, 0x49, 0x21, 0x3b, 0x30, 0xc2, 0xbd, 0xd4, 0x42, 0x18, 0x92,
+  0x7d, 0xc1, 0xdd, 0x21, 0xe8, 0x5c, 0x6f, 0x9b, 0x65, 0xaf, 0x8b, 0x46, 0x1d, 0x37, 0x56, 0xfc, 0xed, 0x3d, 0x8d, 0x32, 0x1c, 0xcc, 0x06, 0x2d,
+  0xe7, 0xd5, 0x02, 0xf7, 0xef, 0xea, 0xd7, 0xcd, 0xee, 0xaa, 0xbd, 0x7d, 0xa9, 0xde, 0xb6, 0x6d, 0x31, 0x27, 0xe4, 0xd9, 0xf2, 0xb0, 0x31, 0x94,
+  0x8b, 0xd1, 0xfa, 0x7a, 0x05, 0x1b, 0x8d, 0xc5, 0x30, 0xad, 0x04, 0xaa, 0x6b, 0xce, 0x17, 0xc3, 0xf3, 0x4c, 0x66, 0xe3, 0x94, 0xce, 0xb7, 0x57,
+  0xfa, 0x78, 0x4e, 0x86, 0xd1, 0x3d, 0x2f, 0x60, 0xbb, 0xe6, 0x87, 0x37, 0xf4, 0xba, 0xf0, 0xe4, 0x3d, 0x19, 0xc8, 0xb7, 0xd7, 0x18, 0x51, 0xa6,
+  0xb3, 0x96, 0x65, 0x3a, 0x4d, 0x75, 0x55, 0x7a, 0x51, 0x71, 0xc4, 0x57, 0xff, 0xa9, 0x3f, 0x9a, 0x4b, 0x5d, 0x7f, 0x10, 0xec, 0x91, 0xb8, 0x0e,
+  0x48, 0xd9, 0xd4, 0x49, 0xdf, 0x3c, 0x96, 0x69, 0x53, 0x2f, 0x21, 0xa4, 0x15, 0x3d, 0x90, 0x88, 0x53, 0xdb, 0x35, 0x8a, 0x1a, 0x4e, 0x2e, 0xd1,
+  0x62, 0x86, 0x03, 0x35, 0x40, 0x84, 0x24, 0x4a, 0x42, 0x9c, 0x90, 0xbb, 0x16, 0xb3, 0x85, 0x25, 0x9a, 0xee, 0x81, 0x30, 0x5c, 0x15, 0x4c, 0x46,
+  0x2f, 0x4e, 0x8f, 0x72, 0xa2, 0xbc, 0x13, 0x56, 0x5f, 0x10, 0xd6, 0x53, 0x25, 0xd4, 0x8b, 0x74, 0xd4, 0x12, 0xa9, 0xc8, 0x57, 0xec, 0x13, 0xb8,
+  0x7c, 0xf2, 0x7a, 0x12, 0x04, 0x07, 0x64, 0x89, 0x70, 0xc4, 0xcb, 0x99, 0x94, 0xa9, 0xc6, 0x5e, 0xa6, 0xa9, 0x11, 0xc1, 0xab, 0x40, 0x1f, 0x02,
+  0xe2, 0xf7, 0x18, 0x9f, 0xa8, 0xb5, 0x07, 0x94, 0x32, 0x20, 0xba, 0xa7, 0x0c, 0x3a, 0xd5, 0xa3, 0xaa, 0x55, 0xf0, 0x16, 0x0b, 0xbc, 0xb8, 0x48,
+  0x24, 0x91, 0x28, 0x92, 0x25, 0xb8, 0xc9, 0x70, 0xf0, 0xc5, 0x63, 0x5c, 0xcb, 0xaf, 0x68, 0xed, 0x0b, 0x98, 0xef, 0x36, 0x20, 0x94, 0x31, 0xd0,
+  0xb8, 0xdc, 0x9e, 0xc6, 0x3a, 0x69, 0x84, 0xf4, 0x77, 0x30, 0x0f, 0x17, 0x41, 0x58, 0x8f, 0x72, 0x55, 0xc1, 0x5e, 0x45, 0x08, 0xf2, 0x49, 0xf7,
+  0x8a, 0x72, 0x14, 0x6c, 0xf2, 0xd6, 0x25, 0x17, 0x4f, 0x13, 0xe2, 0x80, 0xf8, 0x29, 0xbe, 0xa0, 0xbc, 0x84, 0xf5, 0xc8, 0x03, 0x4d, 0xa3, 0x0b,
+  0xea, 0x87, 0xa5, 0x77, 0x03, 0xd6, 0x51, 0x83, 0x0d, 0x1e, 0x3a, 0x90, 0xd8, 0x65, 0x68, 0x09, 0xf7, 0x1c, 0x23, 0xda, 0x28, 0x24, 0x75, 0x95,
+  0x11, 0x1b, 0x2f, 0x4d, 0x5b, 0x66, 0x84, 0x76, 0x75, 0x3b, 0x4a, 0xe6, 0x04, 0x32, 0xf0, 0x85, 0x71, 0x07, 0x50, 0x5e, 0xd2, 0x56, 0x78, 0xce,
+  0xe3, 0x80, 0x97, 0x98, 0xec, 0xc1, 0xfd, 0xdc, 0x83, 0x7f, 0x7c, 0x7b, 0xba, 0xe3, 0x51, 0xd8, 0x86, 0x71, 0xe2, 0xbb, 0xb1, 0x7f, 0x66, 0x7f,
+  0x15, 0xa2, 0x8d, 0x5e, 0xb5, 0xb1, 0x01, 0x37, 0x1a, 0x59, 0xac, 0x96, 0x5c, 0x5e, 0x79, 0x2d, 0x7e, 0x51, 0x66, 0xf8, 0x89, 0x3a, 0x1a, 0xc5,
+  0x45, 0xcb, 0x13, 0xaa, 0x35, 0x48, 0x9f, 0xbd, 0xcc, 0x38, 0x5c, 0xb7, 0x71, 0x31, 0xc7, 0x1f, 0xa7, 0xf0, 0x3f, 0xde, 0xdf, 0xff, 0xea, 0x9c,
+  0xfe, 0x08, 0x9f, 0x47, 0xec, 0x00, 0x93, 0x56, 0xc7, 0x44, 0x61, 0x4e, 0x14, 0x7e, 0xf8, 0xed, 0xf7, 0x87, 0x70, 0x1d, 0xa6, 0xf3, 0xde, 0xfc,
+  0xa8, 0x0f, 0x55, 0x78, 0x09, 0x92, 0x29, 0x0e, 0x9f, 0x3e, 0xde, 0xbd, 0x53, 0x83, 0xc6, 0xf6, 0xa4, 0x8b, 0xbe, 0x49, 0x58, 0x1f, 0x90, 0xf1,
+  0x13, 0xed, 0x47, 0x88, 0x27, 0xd4, 0x71, 0x52, 0x36, 0x51, 0x52, 0x1b, 0xb5, 0x47, 0xb9, 0x6c, 0x05, 0x55, 0xfd, 0xfc, 0xcd, 0xf4, 0x01, 0xb3,
+  0x1d, 0x1c, 0xdd, 0xbb, 0xe5, 0xcb, 0xf4, 0x9e, 0xba, 0x2e, 0x99, 0x8e, 0x30, 0xc2, 0x93, 0xfd, 0x0e, 0x12, 0x8f, 0x06, 0x3c, 0x85, 0xc4, 0x29,
+  0x47, 0xfb, 0xf8, 0x32, 0x7c, 0x1d, 0x9e, 0x27, 0xf6, 0xd2, 0x7b, 0xaa, 0x28, 0xfe, 0x3f, 0xe8, 0xc7, 0x04, 0x19, 0x61, 0x47, 0x16, 0x1e, 0xd0,
+  0xea, 0xf5, 0x3d, 0x26, 0x38, 0x50, 0x37, 0xda, 0xaa, 0xba, 0xca, 0xb2, 0x18, 0x3f, 0xa1, 0x0f, 0x62, 0x00, 0x1c, 0x65, 0xe4, 0x81, 0x7b, 0xc5,
+  0xa8, 0x9f, 0x5d, 0xd2, 0x19, 0x68, 0xab, 0x30, 0x0d, 0xd7, 0x18, 0x84, 0x61, 0x13, 0x01, 0xeb, 0x15, 0x6f, 0x79, 0xec, 0x4f, 0x77, 0x1e, 0x35,
+  0xae, 0xd3, 0x74, 0xb4, 0xe9, 0xf4, 0x79, 0xfe, 0x07, 0xab, 0xc1, 0xed, 0xaa, 0xb4, 0x05, 0x00, 0x00,
+};
 
-const char LOGIN_HTML[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8">
+// login page, gzipped to save room in flash. Its source, to change it (then gzip -9 it into the bytes below):
+/*
+<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Life Logger</title>
 <style>body{font:15px system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#14171c;color:#e6e8eb}
 .b{width:100%;max-width:360px;margin:16px;padding:26px;background:#1d2128;border:1px solid #2c323c;border-radius:14px}
@@ -2119,8 +3064,60 @@ label{display:flex;gap:8px;align-items:center;margin:12px 0;font-size:14px}butto
 <label><input id="k" type="checkbox" checked> Remember this device</label><button>Open Life Logger</button><div id="m"></div><div class="f">Life Logger · Aspect Wave LLC</div></form>
 <script>async function go(){const m=document.getElementById('m');m.textContent='';
 try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'text/plain'},body:JSON.stringify({pw:document.getElementById('pw').value,keep:document.getElementById('k').checked})});
-if(r.ok){location.reload();return}const j=await r.json().catch(()=>({}));m.textContent=j.err||('Error '+r.status)}catch(e){m.textContent='The box did not answer'}}</script></body></html>)HTML";
+if(r.ok){location.reload();return}const j=await r.json().catch(()=>({}));m.textContent=j.err||('Error '+r.status)}catch(e){m.textContent='The box did not answer'}}</script></body></html>
+*/
+const uint8_t LOGIN_HTML_GZ[] PROGMEM = {
+  0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x7d, 0x56, 0x5d, 0x6f, 0xdb, 0x36, 0x14, 0x7d, 0xf7, 0xaf, 0xe0, 0x14, 0x0c, 0xb2,
+  0x31, 0xcb, 0xb6, 0xec, 0x34, 0x71, 0x24, 0xd9, 0xd8, 0x5a, 0xb4, 0x40, 0x87, 0x60, 0x19, 0xda, 0x0e, 0xc5, 0x30, 0xec, 0x81, 0xa2, 0xae, 0x2c,
+  0xc6, 0x92, 0x48, 0x90, 0x94, 0x3f, 0xa6, 0xea, 0x77, 0xed, 0x7d, 0xbf, 0x6c, 0x97, 0x92, 0x9c, 0xda, 0x5d, 0xb2, 0x97, 0x44, 0xa2, 0xee, 0xd7,
+  0x39, 0xf7, 0xdc, 0x4b, 0x47, 0xdf, 0x25, 0x82, 0x99, 0xa3, 0x04, 0x92, 0x99, 0x22, 0x5f, 0x47, 0xfd, 0x5f, 0xa0, 0xc9, 0x3a, 0x2a, 0xc0, 0x50,
+  0xc2, 0x32, 0xaa, 0x34, 0x98, 0x95, 0x53, 0x99, 0xd4, 0x5b, 0x3a, 0xeb, 0x41, 0x77, 0x5c, 0xd2, 0x02, 0x56, 0xce, 0x8e, 0xc3, 0x5e, 0x0a, 0x65,
+  0x1c, 0xc2, 0x44, 0x69, 0xa0, 0x44, 0xb3, 0x3d, 0x4f, 0x4c, 0xb6, 0x4a, 0x60, 0xc7, 0x19, 0x78, 0xed, 0xcb, 0x98, 0x97, 0xdc, 0x70, 0x9a, 0x7b,
+  0x9a, 0xd1, 0x1c, 0x56, 0xbe, 0xb3, 0x8e, 0x0c, 0x37, 0x39, 0xac, 0xef, 0x79, 0x0a, 0xe4, 0x5e, 0x6c, 0x36, 0xa0, 0xa2, 0x69, 0x77, 0x34, 0x88,
+  0xb4, 0x39, 0xe2, 0xff, 0x58, 0x24, 0xc7, 0x3a, 0xc5, 0x98, 0x81, 0xff, 0x4a, 0x1e, 0x88, 0x3e, 0x6a, 0x03, 0x85, 0x57, 0xf1, 0xb1, 0x47, 0xa5,
+  0xcc, 0xc1, 0xeb, 0x0e, 0xc6, 0xce, 0x47, 0xd8, 0x08, 0x20, 0xbf, 0xbd, 0x77, 0xc6, 0x1f, 0x44, 0x2c, 0x8c, 0x18, 0x6b, 0x5a, 0x6a, 0x4f, 0x83,
+  0xe2, 0x69, 0x58, 0x50, 0xb5, 0xe1, 0x65, 0x30, 0x0b, 0x0b, 0x5e, 0x7a, 0x19, 0xf0, 0x4d, 0x86, 0xd1, 0x66, 0xb3, 0x5d, 0x16, 0x26, 0x5c, 0xcb,
+  0x9c, 0x1e, 0x83, 0x34, 0x87, 0x43, 0x48, 0x73, 0xbe, 0x29, 0x3d, 0x8e, 0xe1, 0x74, 0xc0, 0x10, 0x02, 0xa8, 0xf0, 0xb1, 0xd2, 0x86, 0xa7, 0x47,
+  0xaf, 0x07, 0x75, 0x3a, 0x8e, 0x29, 0xdb, 0x6e, 0x94, 0xa8, 0xca, 0x24, 0xb8, 0xf2, 0xaf, 0xfd, 0x5b, 0x9f, 0x85, 0x4c, 0xe4, 0x42, 0x05, 0x57,
+  0x70, 0x03, 0x4b, 0x88, 0x9b, 0xc1, 0x24, 0xae, 0x5b, 0xc8, 0x36, 0xcf, 0xf7, 0x58, 0xc0, 0xa1, 0x63, 0x20, 0x58, 0xdc, 0xcc, 0xe4, 0xe1, 0x54,
+  0x90, 0x7f, 0x83, 0xcf, 0x92, 0x26, 0x09, 0x2f, 0x37, 0xc1, 0xdc, 0xbe, 0x5c, 0x04, 0x4e, 0xe6, 0xfe, 0x7c, 0x19, 0xc6, 0x42, 0x25, 0xa0, 0x02,
+  0xdf, 0x82, 0x17, 0x39, 0x4f, 0xc8, 0xd5, 0x9c, 0x2d, 0xe6, 0x0b, 0xd6, 0x7f, 0xf0, 0x14, 0x4d, 0x78, 0xa5, 0x03, 0xff, 0x5a, 0x1e, 0x9a, 0x41,
+  0xe6, 0xb7, 0x5c, 0x79, 0x9a, 0xff, 0x05, 0xc1, 0x7c, 0xfe, 0x35, 0xd5, 0x8c, 0xcc, 0x88, 0xb5, 0x90, 0x75, 0x5f, 0xe8, 0x32, 0xbe, 0x7b, 0x45,
+  0x17, 0xe1, 0x57, 0x6b, 0x7f, 0x31, 0x79, 0x75, 0x69, 0x6f, 0xcb, 0x6b, 0x06, 0xbc, 0x94, 0x95, 0xf9, 0xc3, 0x0a, 0x63, 0x25, 0xa9, 0xd6, 0x7b,
+  0xcc, 0xfa, 0x67, 0xd7, 0x10, 0x5e, 0x66, 0x48, 0xaf, 0x09, 0xcf, 0x80, 0xc6, 0xe2, 0x60, 0xa3, 0x59, 0x3c, 0x7d, 0x79, 0x78, 0xf2, 0x04, 0xd1,
+  0xb7, 0xd8, 0x2f, 0xcb, 0x5e, 0x3e, 0x9d, 0x9c, 0x23, 0x5c, 0xdc, 0x5d, 0xcf, 0xae, 0xe3, 0x97, 0x69, 0xee, 0x33, 0x37, 0x83, 0x9c, 0xc6, 0x90,
+  0xd7, 0x17, 0x5d, 0xdc, 0x50, 0xd9, 0x46, 0x7d, 0xa6, 0x9b, 0x27, 0xda, 0x91, 0x17, 0x32, 0x3b, 0x87, 0x6e, 0x99, 0x89, 0x2b, 0x63, 0x44, 0xf9,
+  0x22, 0xb2, 0x67, 0x30, 0xa0, 0xa0, 0x9e, 0x01, 0x73, 0x56, 0xf3, 0x22, 0x5e, 0xce, 0xd3, 0x9b, 0x93, 0x34, 0xd2, 0x34, 0x0d, 0x59, 0xa5, 0x34,
+  0x3e, 0x4b, 0xc1, 0x6d, 0x41, 0xcd, 0xe0, 0xaa, 0xa8, 0xcf, 0x34, 0x39, 0xff, 0xaa, 0x0d, 0xcf, 0x08, 0xd9, 0xe5, 0xfa, 0x4f, 0x87, 0x4e, 0xe1,
+  0x96, 0xb7, 0xc8, 0x48, 0x33, 0x49, 0x6b, 0x03, 0x07, 0xe3, 0xb5, 0x70, 0x4f, 0x40, 0x7b, 0x93, 0x9b, 0xf8, 0xf6, 0x7a, 0x79, 0x01, 0x74, 0xfe,
+  0x4d, 0x82, 0x56, 0x34, 0x3f, 0x16, 0x90, 0x70, 0x4a, 0x86, 0x52, 0x41, 0x0a, 0x4a, 0x7b, 0xad, 0x37, 0xce, 0x68, 0x06, 0x05, 0x04, 0xb9, 0xad,
+  0x6c, 0x54, 0xb7, 0x63, 0x78, 0x8e, 0x2d, 0x9d, 0xa7, 0xd7, 0xe9, 0xed, 0x29, 0x93, 0xcf, 0xac, 0x56, 0x1b, 0x54, 0xfd, 0x85, 0x0d, 0x22, 0xee,
+  0x19, 0xea, 0xed, 0x92, 0x04, 0xe6, 0xb0, 0x6c, 0x9e, 0xd5, 0xd4, 0xff, 0x7b, 0xb2, 0xbb, 0x64, 0x96, 0xdc, 0x35, 0x4d, 0x34, 0xed, 0xf6, 0x42,
+  0x34, 0x6d, 0x57, 0xd3, 0x20, 0xb2, 0x95, 0xad, 0xa3, 0x54, 0xa8, 0x82, 0xb0, 0x1c, 0x83, 0xad, 0x9c, 0xd8, 0x21, 0xa2, 0xd4, 0x55, 0x5c, 0x70,
+  0xdc, 0x42, 0x1b, 0x31, 0x1c, 0x85, 0x0a, 0x4c, 0xa5, 0x4a, 0x92, 0xd2, 0x5c, 0x03, 0x2e, 0x9d, 0xcc, 0xbf, 0xdc, 0x38, 0xf8, 0x1e, 0xc9, 0xf5,
+  0xef, 0xa2, 0x72, 0x15, 0x10, 0x05, 0x94, 0x65, 0xd8, 0x69, 0x62, 0x32, 0x20, 0xa8, 0x5e, 0x22, 0x76, 0xa0, 0xc8, 0x51, 0x54, 0x8a, 0x64, 0xa2,
+  0x00, 0xf2, 0x99, 0x7b, 0xef, 0xf8, 0x18, 0x95, 0x4a, 0xb8, 0x21, 0x54, 0x6f, 0x35, 0xc1, 0xdc, 0x4f, 0xc6, 0x27, 0x38, 0x13, 0xf2, 0x50, 0x9e,
+  0x0e, 0x5d, 0x4d, 0xc4, 0xbe, 0x44, 0x6f, 0xa3, 0xa5, 0x30, 0xd6, 0x2d, 0x11, 0xa0, 0x4b, 0xd7, 0x4c, 0xa2, 0xa9, 0x44, 0x04, 0x2d, 0x1b, 0x84,
+  0x27, 0x2b, 0x47, 0xee, 0x1d, 0xd2, 0xb2, 0xe2, 0x9c, 0xe2, 0x38, 0x04, 0x95, 0xcd, 0x20, 0x13, 0x39, 0x72, 0xb1, 0x72, 0x5e, 0x9f, 0xa5, 0x70,
+  0x08, 0xad, 0x8c, 0x60, 0xa2, 0xc0, 0x35, 0x68, 0xd0, 0x05, 0xb5, 0xa5, 0xb0, 0xfd, 0xde, 0xe5, 0xf7, 0x54, 0xb0, 0x4a, 0x63, 0x92, 0x76, 0x52,
+  0xd6, 0x67, 0xb9, 0xb6, 0xa7, 0x54, 0xd8, 0x67, 0xb6, 0xc5, 0x32, 0x71, 0x75, 0xdb, 0x27, 0x48, 0xd6, 0xe4, 0x03, 0x76, 0xbe, 0x88, 0xc1, 0xc2,
+  0xe2, 0x9a, 0x74, 0x2b, 0x3c, 0x9a, 0xf6, 0x21, 0xba, 0x41, 0x59, 0x3f, 0x48, 0x28, 0xc9, 0x05, 0x8d, 0xfd, 0x87, 0x28, 0xe1, 0xbb, 0x36, 0x43,
+  0x81, 0x54, 0x4f, 0xf1, 0xa5, 0x3b, 0xe9, 0x9b, 0x93, 0x3a, 0xe7, 0xdc, 0x93, 0x7f, 0xfe, 0x26, 0x3f, 0x69, 0x09, 0xcc, 0x90, 0xcf, 0x74, 0x87,
+  0xa7, 0xf7, 0x6f, 0x7a, 0x97, 0xa9, 0xed, 0xa8, 0xbd, 0x05, 0x98, 0xe2, 0xd2, 0xac, 0xa9, 0x3e, 0x96, 0x8c, 0xa4, 0x55, 0xc9, 0x0c, 0x17, 0x25,
+  0xb1, 0x5d, 0xc5, 0x4d, 0x56, 0x6a, 0x43, 0x8a, 0x15, 0xde, 0x5b, 0x55, 0x81, 0xc8, 0x27, 0x1b, 0x30, 0x6f, 0x73, 0xb0, 0x8f, 0xaf, 0x8f, 0xef,
+  0x93, 0xa1, 0x5b, 0xb8, 0xa3, 0xb0, 0x98, 0xd8, 0xf1, 0x78, 0xd3, 0x5f, 0x4a, 0xae, 0x1b, 0x0e, 0x8c, 0x3a, 0xf6, 0xae, 0x6a, 0x45, 0xf7, 0x14,
+  0xdb, 0x91, 0x82, 0x61, 0xd9, 0xd0, 0x9d, 0x52, 0xc9, 0xa7, 0xb9, 0xc0, 0xe1, 0x70, 0xc7, 0x35, 0xde, 0x6d, 0x99, 0x48, 0x02, 0xf7, 0xd7, 0x87,
+  0x8f, 0x9f, 0xdc, 0xb1, 0xd5, 0x1a, 0x8e, 0x46, 0x50, 0xbb, 0x7d, 0x24, 0xef, 0x13, 0x72, 0xe7, 0x06, 0xae, 0x0d, 0x3e, 0xc5, 0x16, 0xa1, 0x4f,
+  0x33, 0xb6, 0x52, 0x0c, 0x7e, 0xfe, 0xf8, 0xf0, 0xcb, 0x44, 0x1b, 0x85, 0x12, 0xc2, 0x9b, 0x63, 0x58, 0xcb, 0x7d, 0xf0, 0x62, 0x81, 0x72, 0xef,
+  0x8e, 0x26, 0x3b, 0x9a, 0x57, 0x30, 0xde, 0x02, 0xc8, 0x97, 0x0d, 0xb7, 0x68, 0xd7, 0x77, 0xa7, 0x19, 0x35, 0xa3, 0x70, 0xc0, 0xd3, 0xa1, 0x9a,
+  0x88, 0xed, 0xa8, 0xce, 0x05, 0xa3, 0x96, 0x92, 0x89, 0x82, 0x5c, 0xd0, 0xe4, 0x49, 0xec, 0x4d, 0x07, 0xf1, 0xb1, 0x87, 0xa8, 0x26, 0x8f, 0x5a,
+  0x94, 0x43, 0x8c, 0x42, 0x2d, 0xd6, 0xe1, 0x68, 0xb5, 0x1e, 0xd6, 0xcd, 0xe8, 0x5b, 0x7e, 0x1e, 0x27, 0xa0, 0xd4, 0x97, 0x2f, 0x43, 0xf7, 0xad,
+  0x52, 0xa8, 0x6a, 0xf7, 0x07, 0x85, 0x50, 0xa8, 0xa9, 0xf4, 0xa8, 0xe9, 0x1c, 0x61, 0x54, 0x7f, 0xc3, 0xe8, 0xa7, 0x5e, 0xf9, 0x09, 0x2e, 0xee,
+  0x12, 0xe5, 0x8d, 0xd7, 0xee, 0x1e, 0x94, 0xdb, 0x4e, 0x6a, 0xd7, 0x3b, 0x54, 0x46, 0x3b, 0xa3, 0xd3, 0xf6, 0x27, 0xc5, 0xbf, 0x31, 0x82, 0x5d,
+  0xbc, 0x68, 0x08, 0x00, 0x00,
+};
 
+void sendGz(const uint8_t* d, size_t n) { server.sendHeader("Content-Encoding", "gzip"); server.send_P(200, "text/html", (const char*)d, n); }
 const char* uiSource() {
   if (sdOK && SD.exists("/www/index.html")) return "sd";              // test override on the card
   if (flashOK && LittleFS.exists("/www/index.html.gz")) return "flash";
@@ -2129,9 +3126,9 @@ const char* uiSource() {
 }
 
 void handleRoot() {
-  if (!authed()) { server.sendHeader("Cache-Control", "no-store"); server.send_P(200, "text/html", LOGIN_HTML); return; }
+  if (!authed()) { server.sendHeader("Cache-Control", "no-store"); sendGz(LOGIN_HTML_GZ, sizeof LOGIN_HTML_GZ); return; }
   const char* src = uiSource();
-  if (!strcmp(src, "none")) { server.send_P(200, "text/html", UPDATE_HTML); return; }   // first install: ask for the .lbk
+  if (!strcmp(src, "none")) { sendGz(UPDATE_HTML_GZ, sizeof UPDATE_HTML_GZ); return; }   // first install: ask for the .lbk
   fs::FS& fs = !strcmp(src, "sd") ? (fs::FS&)SD : (fs::FS&)LittleFS;
   bool gz = strcmp(src, "flash") == 0 && LittleFS.exists("/www/index.html.gz");
   File f = fs.open(gz ? "/www/index.html.gz" : "/www/index.html", FILE_READ);
@@ -2140,51 +3137,41 @@ void handleRoot() {
   f.close();
 }
 
+// one "key":value pair of a JSON object (v is already JSON); smaller code than chains of String +
+void kv(String& s, const char* k, const String& v) { s += ",\""; s += k; s += "\":"; s += v; }
+void kvB(String& s, const char* k, bool v) { kv(s, k, v ? "true" : "false"); }
+void kvU(String& s, const char* k, uint32_t v) { kv(s, k, String(v)); }
+void kvS(String& s, const char* k, const String& v) { kv(s, k, jStr(v)); }
 void handleStatus() {
+  if (server.hasArg("dev")) devSeen(server.arg("dev"));   // the dashboard says which phone or computer it's open on (for JOIN)
   time_t t = time(nullptr);
   String s; s.reserve(2800);
   s += "{\"fw\":\"" FW_VERSION "\"";
-  s += ",\"epoch\":" + String((uint32_t)t);
-  s += ",\"local\":" + jStr(isoLocal(t));
-  s += ",\"tz\":" + jStr(cfg.tz) + ",\"setupDone\":" + jBool(cfg.setupDone);
-  s += ",\"passSet\":" + jBool(passSet()) + ",\"login\":" + jBool(needLogin()) + ",\"remembered\":" + String(sessKept());
-  s += ",\"timeValid\":" + jBool(timeValid);
-  s += ",\"timeSrc\":" + jStr(timeSrc);
-  s += ",\"rtcOK\":" + jBool(rtcOK);
-  s += ",\"store\":" + jStr(storeName);
-  s += ",\"storeOK\":" + jBool(store != nullptr);
-  s += ",\"flashOK\":" + jBool(flashOK);
-  s += ",\"flashKB\":" + String(flashOK ? LittleFS.usedBytes() / 1024 : 0);
-  s += ",\"flashTotalKB\":" + String(flashOK ? LittleFS.totalBytes() / 1024 : 0);
-  s += ",\"sdOK\":" + jBool(sdOK);
-  s += ",\"cardMB\":" + String(sdOK ? (uint32_t)(SD.cardSize() / (1024ULL * 1024ULL)) : 0);
-  s += ",\"eeOK\":" + jBool(eeOK);
-  s += ",\"lastAlive\":" + jStr(lastAlive > 1735689600UL ? isoLocal(lastAlive) : String(""));
-  s += ",\"resetReason\":" + jStr(resetName(resetReason));
-  s += ",\"logSeq\":" + String(logNextSeq - 1);
-  s += ",\"logBytes\":" + String(logBytes);
-  s += ",\"envLogS\":" + String(ENV_LOG_S);
-  s += ",\"envFlashDays\":" + String(ENV_FLASH_DAYS);
-  s += ",\"uiSrc\":" + jStr(uiSource());
-  s += ",\"docVer\":" + String(docVer);
-  s += ",\"sta\":{\"ssid\":" + jStr(cfg.homeSsid) + ",\"up\":" + jBool(WiFi.status() == WL_CONNECTED);
-  s += ",\"ip\":" + jStr(WiFi.localIP().toString()) + ",\"rssi\":" + String(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0) + "}";
-  s += ",\"ap\":{\"up\":" + jBool(apUp);
-  s += ",\"ssid\":" + jStr(cfg.apSsid) + ",\"ip\":" + jStr(WiFi.softAPIP().toString()) + ",\"clients\":" + String(WiFi.softAPgetStationNum()) + "}";
-  s += ",\"channel\":" + String(WiFi.channel());
-  s += ",\"mdns\":" + jStr(String(MDNS_NAME) + ".local");
-  uint8_t m[6]; WiFi.macAddress(m);
-  s += ",\"hubMac\":" + jStr(macStr(m));
-  s += ",\"uptime\":" + String(millis() / 1000);
-  s += ",\"heap\":" + String(ESP.getFreeHeap());
-  s += ",\"batt\":{\"ok\":" + jBool(battType != 0) + ",\"pct\":" + jNum(battPct, 0) + ",\"v\":" + jNum(battV, 2) + ",\"rate\":" + jNum(battRate, 1) + "}";
-  s += ",\"gps\":{\"seen\":" + jBool(gps.seen && millis() - gps.lastNmeaMs < 5000) + ",\"fix\":" + jBool(gps.fix) + ",\"sats\":" + String(gps.sats);
-  s += ",\"kn\":" + jNum(gps.kn, 1);
-  if (gps.lastFixMs) s += ",\"lat\":" + String(gps.lat, 6) + ",\"lon\":" + String(gps.lon, 6) + ",\"fixAge\":" + String((millis() - gps.lastFixMs) / 1000);
-  s += ",\"ptsToday\":" + String(gps.ptsDay == trackDate(t) ? gps.ptsToday : 0) + ",\"store\":" + jStr(sdOK ? "sd" : "flash") + "}";
-  s += ",\"alarm\":" + alarmsJson();
-  s += ",\"screen\":{\"ok\":" + jBool(oledOK) + ",\"on\":" + jBool(screenOn) + ",\"enc\":" + jBool(encOK) + ",\"encAddr\":" + String(encAddr) + ",\"offMin\":" + String(cfg.scrOffMin) + ",\"clHide\":" + jBool(cfg.clHideDone) + "}";
-  s += ",\"gpsBus\":" + jBool(gpsI2C);
+  kvU(s, "epoch", (uint32_t)t); kvS(s, "local", isoLocal(t));
+  kvS(s, "tz", cfg.tz); kvB(s, "setupDone", cfg.setupDone);
+  if (findPhoneEp) kvU(s, "findPhone", findPhoneEp);      // the ACTION shortcut asked the open dashboards to sound
+  kvB(s, "passSet", passSet()); kvB(s, "login", needLogin()); kv(s, "remembered", String(sessKept()));
+  kvB(s, "timeValid", timeValid); kvS(s, "timeSrc", timeSrc); kvB(s, "rtcOK", rtcOK);
+  kvS(s, "store", storeName); kvB(s, "storeOK", store != nullptr); kvB(s, "flashOK", flashOK);
+  kvU(s, "flashKB", flashOK ? LittleFS.usedBytes() / 1024 : 0); kvU(s, "flashTotalKB", flashOK ? LittleFS.totalBytes() / 1024 : 0);
+  kvB(s, "sdOK", sdOK); kvU(s, "cardMB", sdOK ? (uint32_t)(SD.cardSize() / (1024ULL * 1024ULL)) : 0);
+  kvB(s, "eeOK", eeOK); kvS(s, "lastAlive", lastAlive > 1735689600UL ? isoLocal(lastAlive) : String(""));
+  kvS(s, "resetReason", resetName(resetReason));
+  kvU(s, "logSeq", logNextSeq - 1); kvU(s, "logBytes", logBytes); kvU(s, "logBad", logBadLines); kvU(s, "envLogS", ENV_LOG_S); kvU(s, "envFlashDays", ENV_FLASH_DAYS);
+  kvS(s, "uiSrc", uiSource()); kvU(s, "docVer", docVer);
+  bool up = WiFi.status() == WL_CONNECTED;
+  s += ",\"sta\":{\"ssid\":" + jStr(cfg.homeSsid); kvB(s, "up", up); kvS(s, "ip", WiFi.localIP().toString()); kv(s, "rssi", String(up ? WiFi.RSSI() : 0)); s += "}";
+  s += ",\"ap\":{\"up\":" + jBool(apUp); kvS(s, "ssid", cfg.apSsid); kvS(s, "ip", WiFi.softAPIP().toString()); kvU(s, "clients", WiFi.softAPgetStationNum()); s += "}";
+  kvU(s, "channel", WiFi.channel()); kvS(s, "mdns", String(MDNS_NAME) + ".local");
+  uint8_t m[6]; WiFi.macAddress(m); kvS(s, "hubMac", macStr(m));
+  kvU(s, "uptime", millis() / 1000); kvU(s, "heap", ESP.getFreeHeap());
+  s += ",\"batt\":{\"ok\":" + jBool(battType != 0); kv(s, "pct", jNum(battPct, 0)); kv(s, "v", jNum(battV, 2)); kv(s, "rate", jNum(battRate, 2)); kv(s, "left", jNum(battLeftH, 1)); kvB(s, "chg", battChg); kvB(s, "measuring", !battChg && !battSpanOk); kv(s, "offV", jNum(BATT_OFF_V, 2)); s += "}";
+  s += ",\"gps\":{\"mode\":\"" + String(gpsMode == 1 ? "on" : gpsMode == 2 ? "off" : "auto") + "\",\"asleep\":" + jBool(gpsAsleep) + ",\"seen\":" + jBool(gps.seen && millis() - gps.lastNmeaMs < 5000); kvB(s, "fix", gps.fix); kvU(s, "sats", gps.sats); kv(s, "kn", jNum(gps.kn, 1));
+  if (gps.lastFixMs) { kv(s, "lat", String(gps.lat, 6)); kv(s, "lon", String(gps.lon, 6)); kvU(s, "fixAge", (millis() - gps.lastFixMs) / 1000); }
+  kvU(s, "ptsToday", gps.ptsDay == trackDate(t) ? gps.ptsToday : 0); kvS(s, "store", sdOK ? "sd" : "flash"); s += "}";
+  kv(s, "alarm", alarmsJson());
+  s += ",\"screen\":{\"ok\":" + jBool(oledOK); kvB(s, "on", screenOn); kvB(s, "enc", encOK); kvU(s, "encAddr", encAddr); kvU(s, "offMin", cfg.scrOffMin); kvB(s, "clHide", cfg.clHideDone); s += "}";
+  kvB(s, "gpsBus", gpsI2C);
   s += ",\"nodes\":[";
   bool first = true;
   for (int i = 0; i < MAX_NODES; i++) {
@@ -2192,14 +3179,11 @@ void handleStatus() {
     if (!n.used) continue;
     if (!first) s += ",";
     first = false;
-    s += "{\"name\":" + jStr(n.name) + ",\"mac\":" + jStr(macStr(n.mac));
-    s += ",\"tempC\":" + jNum(n.tempC, 2) + ",\"rh\":" + jNum(n.rh, 1);
-    s += ",\"vbat\":" + jNum(n.vbat, 3) + ",\"soc\":" + jNum(n.soc, 1);
+    s += "{\"name\":" + jStr(n.name); kvS(s, "mac", macStr(n.mac));
+    kv(s, "tempC", jNum(n.tempC, 2)); kv(s, "rh", jNum(n.rh, 1)); kv(s, "vbat", jNum(n.vbat, 3)); kv(s, "soc", jNum(n.soc, 1));
     uint32_t ag = nodeAge(n);
-    s += ",\"rssi\":" + String(n.rssi) + ",\"age\":" + (ag == 0xFFFFFFFFUL ? String("null") : String(ag)) + ",\"live\":" + jBool(n.live);
-    s += ",\"backfilled\":" + String(n.bfRows);
-    s += ",\"interval\":" + String(n.interval) + ",\"count\":" + String(n.count);
-    s += ",\"seq\":" + String(n.seq) + ",\"sensorOK\":" + jBool(n.flags & 1);
+    kv(s, "rssi", String(n.rssi)); kv(s, "age", ag == 0xFFFFFFFFUL ? String("null") : String(ag)); kvB(s, "live", n.live);
+    kvU(s, "backfilled", n.bfRows); kvU(s, "interval", n.interval); kvU(s, "count", n.count); kvU(s, "seq", n.seq); kvB(s, "sensorOK", n.flags & 1);
     s += "}";
   }
   s += "]}";
@@ -2209,7 +3193,7 @@ void handleStatus() {
 
 void handleLogGet() {
   server.sendHeader("Cache-Control", "no-store");
-  if (!store) { sendErr(503, "No storage available"); return; }
+  if (!store) { sendErr(503, flashOK && LittleFS.exists(LOG_ONCARD) ? "The log is on the SD card: put the card back in the box" : "No storage available"); return; }
   File f = store->open(LOG_PATH, FILE_READ);
   if (!f) { server.send(200, "application/x-ndjson", ""); return; }
   server.streamFile(f, "application/x-ndjson");
@@ -2218,7 +3202,7 @@ void handleLogGet() {
 
 // Body: one JSON event per line. Each is stored as {"seq":N,"ts":"<local ISO>","e":<event>}
 void handleLogPost() {
-  if (!store)     { sendErr(503, "No storage available"); return; }
+  if (!store)     { sendErr(503, flashOK && LittleFS.exists(LOG_ONCARD) ? "The log is on the SD card: put the card back in the box" : "No storage available"); return; }
   if (!timeValid) { sendErr(409, "Hub clock not set"); return; }
   String body = server.arg("plain");
   if (body.length() == 0 || body.length() > 32768) { sendErr(400, "Empty or oversized body"); return; }
@@ -2436,7 +3420,7 @@ void handleDocPut() {
     ensureDirs(LittleFS); ok = writeDoc(LittleFS, p, body);
   }
   if (!ok) { sendErr(503, "Could not save the document"); return; }
-  docVer++;
+  docVer++; redraw = true;                                 // the screen shows the change straight away
   server.send(200, "application/json", "{\"ok\":true,\"ver\":" + String(docVer) + "}");
 }
 
@@ -2510,42 +3494,87 @@ void handleDocDel() {
 }
 
 // ---------- GPS track files ----------
-void listGpsDays(fs::FS& fs, String& out, bool& first) {
-  File d = fs.open("/gps");
-  if (!d) return;
-  File e = d.openNextFile();
-  while (e) {
+// The box's own track is /gps/YYYY-MM-DD.csv; Google Timeline points brought in from the dashboard go beside
+// it in /gps/x/YYYY-MM-DD.csv, so they can be taken off again without touching the box's own.
+void listGpsDir(fs::FS& fs, const char* dir, std::vector<GDay>& L, bool isX) {
+  File d = fs.open(dir);
+  if (!d || !d.isDirectory()) { if (d) d.close(); return; }
+  for (File e = d.openNextFile(); e; e = d.openNextFile()) {
     String nm = e.name(); int sl = nm.lastIndexOf('/'); if (sl >= 0) nm = nm.substring(sl + 1);
-    size_t sz = e.size();
-    e.close();
-    if (nm.endsWith(".csv") && nm.length() == 14 && out.indexOf(nm.substring(0, 10)) < 0) {
-      if (!first) out += ",";
-      first = false;
-      out += "[\"" + nm.substring(0, 10) + "\"," + String(sz) + "]";
-    }
-    e = d.openNextFile();
+    uint32_t sz = e.size(); bool dir2 = e.isDirectory(); e.close();
+    if (dir2 || !nm.endsWith(".csv") || nm.length() != 14) continue;
+    String day = nm.substring(0, 10); GDay* g = nullptr;
+    for (auto& x : L) if (x.d == day) { g = &x; break; }
+    if (!g) { L.push_back(GDay()); g = &L.back(); g->d = day; }
+    uint32_t& v = isX ? g->x : g->own; if (!v) v = sz;      // the card's copy first
   }
   d.close();
 }
-void handleGpsDays() {
-  String s = "["; bool first = true;
-  if (sdOK) listGpsDays(SD, s, first);
-  if (flashOK) listGpsDays(LittleFS, s, first);
+void handleGpsDays() {                                    // [["2026-11-20", box's own bytes, Google Timeline bytes], ...]
+  std::vector<GDay> L;
+  if (sdOK) { listGpsDir(SD, "/gps", L, false); listGpsDir(SD, "/gps/x", L, true); }
+  if (flashOK) { listGpsDir(LittleFS, "/gps", L, false); listGpsDir(LittleFS, "/gps/x", L, true); }
+  for (size_t i = 1; i < L.size(); i++) for (size_t k = i; k > 0 && L[k].d < L[k - 1].d; k--) std::swap(L[k], L[k - 1]);
+  String s = "[";
+  for (size_t i = 0; i < L.size(); i++) s += String(i ? "," : "") + "[\"" + L[i].d + "\"," + String(L[i].own) + "," + String(L[i].x) + "]";
   s += "]";
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", s);
 }
-void handleGps() {
+fs::FS* gpsFileFS(const String& path) { return (sdOK && SD.exists(path)) ? (fs::FS*)&SD : (flashOK && LittleFS.exists(path)) ? (fs::FS*)&LittleFS : nullptr; }
+void handleGps() {                                        // the day's CSV: the box's own points, then any brought in from Google
   String d = server.arg("date");
   if (!validDate(d)) { sendErr(400, "date=YYYY-MM-DD"); return; }
-  String path = "/gps/" + d + ".csv";
-  fs::FS* fs = (sdOK && SD.exists(path)) ? (fs::FS*)&SD : (flashOK && LittleFS.exists(path)) ? (fs::FS*)&LittleFS : nullptr;
-  if (!fs) { sendErr(404, "No track for that date"); return; }
-  File f = fs->open(path, FILE_READ);
+  String p1 = "/gps/" + d + ".csv", p2 = "/gps/x/" + d + ".csv";
+  fs::FS* f1 = gpsFileFS(p1); fs::FS* f2 = gpsFileFS(p2);
+  if (!f1 && !f2) { sendErr(404, "No track for that date"); return; }
+  static const char HDR[] = "utc,lat,lon,alt_m,kn,sats,hdop,seg\n";
+  File a = f1 ? f1->open(p1, FILE_READ) : File(), b = f2 ? f2->open(p2, FILE_READ) : File();
+  size_t total = (a ? a.size() : strlen(HDR)) + (b ? b.size() : 0);
   server.sendHeader("Cache-Control", "no-store");
-  server.streamFile(f, "text/csv");
-  f.close();
+  server.setContentLength(total);
+  server.send(200, "text/csv", "");
+  if (!a) server.sendContent(HDR);
+  uint8_t buf[1024];
+  for (File* f : { &a, &b }) { if (!*f) continue; int n; while ((n = f->read(buf, sizeof buf)) > 0) server.sendContent((const char*)buf, n); f->close(); }
 }
+void handleGpsAdd() {                                     // Google Timeline rows for one day, in pieces: utc,lat,lon,alt_m,kn,sats,hdop,seg
+  String d = server.arg("date");
+  if (!validDate(d)) { sendErr(400, "date=YYYY-MM-DD"); return; }
+  String body = server.arg("plain");
+  if (!body.length() || body.length() > 49152) { sendErr(400, "Empty or oversized body (send fewer rows at a time)"); return; }
+  fs::FS* fs = gpsFS(); if (!fs) { sendErr(503, "No storage available"); return; }
+  if (fs == &LittleFS && LittleFS.totalBytes() - LittleFS.usedBytes() < body.length() + 300 * 1024) { sendErr(507, "Flash is nearly full - insert the SD card to bring in a timeline"); return; }
+  if (!fs->exists("/gps")) fs->mkdir("/gps");
+  if (!fs->exists("/gps/x")) fs->mkdir("/gps/x");
+  File f = fs->open("/gps/x/" + d + ".csv", FILE_APPEND);
+  if (!f) { sendErr(503, "Could not write"); return; }
+  int rows = 0, a = 0;
+  while (a < (int)body.length()) {
+    int b = body.indexOf('\n', a); if (b < 0) b = body.length();
+    String l = body.substring(a, b); a = b + 1; l.trim();
+    int c1 = l.indexOf(','), c2 = c1 < 0 ? -1 : l.indexOf(',', c1 + 1);
+    if (!l.startsWith(d.substring(0, 2)) || l.length() > 120 || c1 < 19 || c2 < 0) continue;   // 2026-11-20T08:00:00Z,lat,lon,...
+    if (f.println(l) != l.length() + 2) { f.close(); sendErr(507, "Storage full"); return; }
+    rows++;
+  }
+  f.close();
+  if (!rows) { sendErr(400, "No valid rows"); return; }
+  server.send(200, "application/json", "{\"ok\":true,\"rows\":" + String(rows) + "}");
+}
+void handleGpsDel() {                                     // takes the Google Timeline points off a day; the box's own track stays
+  String d = server.arg("date");
+  if (!validDate(d)) { sendErr(400, "date=YYYY-MM-DD"); return; }
+  String p = "/gps/x/" + d + ".csv"; bool any = false;
+  if (sdOK && SD.exists(p)) any |= SD.remove(p);
+  if (flashOK && LittleFS.exists(p)) any |= LittleFS.remove(p);
+  server.send(200, "application/json", String("{\"ok\":true,\"removed\":") + jBool(any) + "}");
+}
+
+// ---------- a shared Google Maps list link: fetching it needs HTTPS, and the TLS code doesn't fit in the
+// firmware's 1.25 MB (the app half of the "Default 4MB with spiffs" partitions, kept so .lbk updates work).
+// Google Takeout's Saved lists (.csv) and Saved Places.json import without it. ----------
+void handleGmapsList() { sendErr(501, "This box can't fetch Google links (no room for HTTPS in its firmware). Use Google Takeout > Saved instead"); }
 
 // ---------- restore a backup: replaces the work-order log (the old one is kept beside it) ----------
 File rsFile; bool rsAuth = false, rsOK = false; size_t rsBytes = 0; String rsErr;
@@ -2576,15 +3605,20 @@ void handleRestoreDone() {
   int c = f ? f.peek() : -1;
   if (f) f.close();
   if (rsBytes < 10 || c != '{') { store->remove("/hwo/log.new"); sendErr(400, "That is not a log file"); return; }
+  uint32_t kept = 0, bad = 0;
+  bool nz = normalizeLog(*store, "/hwo/log.new", "/hwo/log.chk", true, kept, bad);
+  store->remove("/hwo/log.new");
+  if (!nz || !kept) { store->remove("/hwo/log.chk"); sendErr(400, nz ? "No readable lines in that log" : "Write failed (full?)"); return; }
   store->remove("/hwo/log.before-restore.jsonl");
   if (store->exists(LOG_PATH)) store->rename(LOG_PATH, "/hwo/log.before-restore.jsonl");
-  if (!store->rename("/hwo/log.new", LOG_PATH)) { sendErr(503, "Rename failed - old log kept as log.before-restore.jsonl"); return; }
-  if (store == &LittleFS && sdOK) {
-    if (SD.exists(LOG_PATH)) { SD.remove("/hwo/log.before-restore.jsonl"); SD.rename(LOG_PATH, "/hwo/log.before-restore.jsonl"); }
-    copyFile(LittleFS, SD, LOG_PATH);
-  }
+  if (!store->rename("/hwo/log.chk", LOG_PATH)) { sendErr(503, "Rename failed - old log kept as log.before-restore.jsonl"); return; }
+  if (store == &SD && flashOK) {                          // flash takes a copy of the restored log if it fits
+    LittleFS.remove(LOG_PATH);
+    size_t n = fileSize(SD, LOG_PATH);
+    if (flashFree() >= n + LOG_FLASH_KEEP && copyFile(SD, LittleFS, LOG_PATH)) { LittleFS.remove(LOG_ONCARD); flashCopy = true; } else dropFlashCopy();
+  } else if (store == &LittleFS) flashCopy = false;
   scanLog();
-  server.send(200, "application/json", "{\"ok\":true,\"events\":" + String(logNextSeq - 1) + "}");
+  server.send(200, "application/json", "{\"ok\":true,\"events\":" + String(kept) + ",\"damaged\":" + String(bad) + "}");
 }
 
 // ---------- settings ----------
@@ -2695,7 +3729,7 @@ void setupWeb() {
   server.on("/api/env", HTTP_GET, G(handleEnv));
   server.on("/api/time", HTTP_POST, G(handleTime));
   server.on("/dl", HTTP_GET, G(handleDownload));
-  server.on("/update", HTTP_GET, []() { server.send_P(200, "text/html", UPDATE_HTML); });
+  server.on("/update", HTTP_GET, []() { sendGz(UPDATE_HTML_GZ, sizeof UPDATE_HTML_GZ); });
   server.on("/update", HTTP_POST,
     []() {
       bool ok = otaAuthorized && (upKind == 1 || upKind == 4) && !Update.hasError() && Update.isFinished();   // a cut-off file never counts
@@ -2732,6 +3766,8 @@ void setupWeb() {
             if (u < 0 || bi < 0 || !flashOK) { upKind = 9; otaErr = flashOK ? "Bad update file header" : "Flash not mounted"; return; }
             upUiLeft = upHead.substring(u + 5).toInt(); upBinSize = upHead.substring(bi + 6).toInt();
             if (!LittleFS.exists("/www")) LittleFS.mkdir("/www");
+            LittleFS.remove("/www/index.tmp");
+            if (flashFree() < upUiLeft + 64 * 1024) { LittleFS.remove("/www/index.html.gz"); LittleFS.remove("/www/index.html"); }   // short of room: the old dashboard goes first (the box shows its update page until the new one is in)
             upUi = LittleFS.open("/www/index.tmp", FILE_WRITE);
             if (!upUi || upUiLeft < 1000 || upBinSize < 100000) { upKind = 9; otaErr = "Bad update file"; return; }
             continue;
@@ -2805,6 +3841,9 @@ void setupWeb() {
   server.on("/api/scan", HTTP_GET, G(handleScan));
   server.on("/api/gpsdays", HTTP_GET, G(handleGpsDays));
   server.on("/api/gps", HTTP_GET, G(handleGps));
+  server.on("/api/gps-add", HTTP_POST, G(handleGpsAdd));
+  server.on("/api/gps-del", HTTP_POST, G(handleGpsDel));
+  server.on("/api/gmaps-list", HTTP_GET, G(handleGmapsList));
   server.on("/api/restore", HTTP_POST, handleRestoreDone, handleRestoreUpload);
   server.on("/api/att-del", HTTP_POST, []() {
     if (!gate()) return;
@@ -2831,12 +3870,38 @@ void i2cPowerOn() {
   pinMode(PIN_I2C_POWER, INPUT);
   delay(1);
   bool rest = digitalRead(PIN_I2C_POWER);
+  i2cRest = rest;
   pinMode(PIN_I2C_POWER, OUTPUT);
   digitalWrite(PIN_I2C_POWER, !rest);
   delay(10);
 #endif
 }
 
+void lowShow(const char* l1, const char* l2, const char* l3, const char* l4, uint32_t ms) {
+  if (!oledOK) return;
+  oled.oled_command(SSD1327_DISPLAYON);
+  oled.clearDisplay(); oled.setTextColor(C_ON); oled.setTextSize(1);
+  oled.setCursor(1, 20); oled.print(l1); oled.setCursor(1, 44); oled.print(l2); oled.setCursor(1, 56); oled.print(l3); oled.setCursor(1, 68); oled.print(l4);
+  String v = !isnan(battV) ? String(battV, 2) + " V" : String("");
+  oled.setCursor(1, 92); oled.print(v);
+  oled.display(); delay(ms);
+  oled.clearDisplay(); oled.display(); oled.oled_command(SSD1327_DISPLAYOFF);
+}
+void lowBattOff() {
+  Serial.printf("Battery %.2f V: switching off\n", battV);
+  heartbeatNow(true);                                      // the off time is measured from now, and History will say why
+  lowShow("BATTERY LOW", "Switched off.", "Charge it, then", "press power off & on", 6000);
+  ledcWrite(BTN_LED, 0); ledcWrite(BTN2_LED, 0);
+  WiFi.mode(WIFI_OFF);
+  if (sdOK) SD.end();                                      // every write is already closed; this just lets go of the card
+  if (flashOK) LittleFS.end();
+#if defined(PIN_I2C_POWER)
+  digitalWrite(PIN_I2C_POWER, i2cRest);                    // the GPS, screen, knob and EEPROM off
+#endif
+  Serial.flush();
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+  esp_deep_sleep_start();                                  // nothing wakes it: only the power button (EN) restarts it
+}
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -2865,10 +3930,11 @@ void setup() {
 
   flashOK = startFlash();
   if (flashOK) { cfgLoad(); sessLoad(); } else cfgDefaults();
+  tripResume();
   setenv("TZ", cfg.tz.c_str(), 1); tzset();
   sdOK = startSD();
-  chooseStore();
   syncSdMirror();
+  chooseStore();
   seedNodes();
 
   Serial.printf("Screen %s  GPS %s\n", oledOK ? "ok" : "none", gpsI2C ? "ok" : "none");
@@ -2899,6 +3965,7 @@ void loop() {
     lastNtpSync = millis();
   }
   gpsTick();
+  gpsPowerTick();
   battTick();
   screenTick();
 
@@ -2913,8 +3980,8 @@ void loop() {
     SD.end();
     sdOK = startSD();
     if (sdOK) {
-      if (!store) chooseStore();
       syncSdMirror();
+      chooseStore();
       Serial.println("SD card mounted");
     }
   }
