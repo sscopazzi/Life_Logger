@@ -1,0 +1,23 @@
+Assembly,Function,Part,Adafruit PID or source,Price low (USD),Price high (USD)
+Box,Processor and Wi-Fi,"ESP32-S2 Feather with w.FL antenna socket, 4 MB flash + 2 MB PSRAM, STEMMA QT, battery gauge",6282,17.50,17.50
+Box,Wi-Fi antenna,"RP-SMA to w.FL (MHF3) panel-mount adapter, 20 cm, and a 2.4 GHz dipole swivel antenna, RP-SMA, 2 dBi","5444, 944",9.90,9.90
+Box,Clock and storage,Adalogger FeatherWing (PCF8523 real-time clock + microSD) w/ CR1220 and microSD card,"2922, 380, 5252 / 1294",15.00,33.50
+Box,Position,"Mini GPS PA1010D, I2C, built-in antenna (STEMMA QT)",4415,29.95,29.95
+Box,Display,"1.5 in 128 × 128 grayscale OLED (SSD1327, STEMMA QT)",4741,22.50,22.50
+Box,Knob,"I2C STEMMA QT rotary encoder breakout with encoder (24 detents, push switch, seesaw)",5880,7.95,7.95
+Box,BACK and SELECT buttons,"Rugged metal pushbutton, 16 mm, momentary, white LED ring (×2)",558,9.90,9.90
+Box,Power switch,"SS12F15 micro slide switch, SPDT, 3 pins, 5 mm knob (the 3 mm wall leaves 2 mm of knob outside)",Amazon,pack,
+Box,Buzzer,"Large enclosed piezo element, 30 mm, with wires",1739,0.95,0.95
+Box,On/off record,24LC32 I2C EEPROM (STEMMA QT),5146,3.95,3.95
+Box,Pressure,BMP388 precision barometric pressure sensor (STEMMA QT),3966,9.95,9.95
+Box,Vibration,DRV2605L haptic motor controller (STEMMA QT) and a vibrating mini motor disc,"2305, 1201",9.90,9.90
+Box,USB power sense,"100 kΩ resistor, 1/4 W (×2)",Many vendors,0.20,0.20
+Box,Wiring hub,"Terminal Block Breakout FeatherWing, assembled",2926,14.95,14.95
+Box,GND bus,"Terminal block, 2.54 mm pitch, 8-pin",2141,3.50,3.50
+Box,Wires,"STEMMA QT cables, 50–100 mm (×6) and arcade quick-connect wire pairs (10-pack)","4399, 4210, 1152",11.65,11.65
+Box,Power,"LiPo battery, USB-C panel-mount extension","328 or 5035, 6069",19.50,34.50
+Box,Housing,"Machined aluminum case: lid with the screen window and button holes, side panels for the GPS, Wi-Fi antenna, knob, USB-C and power switch",Machine shop,quote,
+Box,Miscellaneous,"Feather stacking headers, M2.5 / M3 standoffs and screws, double-sided foam tape, hook-up wire",Many vendors,10.00,10.00
+House node,Processor and radio,ESP32-S2 Feather with w.FL antenna socket (as in the box),6282,17.50,17.50
+House node,Temperature and humidity,SHT30 sensor with STEMMA QT adapter,"5064, 5961",11.00,11.00
+House node,Power,LiPo 3.7 V 2000 mAh (JST-PH),2011,12.50,12.50

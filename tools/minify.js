@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Aspect Wave LLC
+// SPDX-License-Identifier: GPL-3.0-or-later
 // dashboard.html -> minified html (script through terser, CSS whitespace squeezed)
 const fs = require('fs'), {minify} = require('terser');
 (async () => {

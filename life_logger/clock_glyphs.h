@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Aspect Wave LLC
+// SPDX-License-Identifier: GPL-3.0-or-later
 // made by tools/clock_glyphs.py: the CLOCK screen's segment digits, 4-bit grey, two pixels a byte (high nibble first)
 #pragma once
 static const char CLK_BIG_C[] = "0123456789"; static const uint8_t CLK_BIG_W = 18, CLK_BIG_H = 34;

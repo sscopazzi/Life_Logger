@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Aspect Wave LLC
+# SPDX-License-Identifier: GPL-3.0-or-later
 # .lbk = "LOGBOOK1 {json}\n" + gzipped dashboard + firmware .bin
 import gzip, json, sys
 html, binf, out, ver = sys.argv[1:5]

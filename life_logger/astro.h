@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Aspect Wave LLC
+// SPDX-License-Identifier: GPL-3.0-or-later
 // astro.h  Life Logger: sun and moon for the SUN & MOON screen, worked out on the box from a position and the clock.
 // Sun: the Astronomical Almanac's low-precision formulas (about 0.01 deg). Moon: Paul Schlyter's orbital
 // elements with the main perturbations (about 2 arcmin). Rise and set are found by stepping the altitude in

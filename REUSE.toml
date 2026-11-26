@@ -1,0 +1,35 @@
+version = 1
+SPDX-PackageName = "Aspect Wave Life Logger"
+SPDX-PackageSupplier = "Aspect Wave LLC"
+SPDX-PackageDownloadLocation = "https://github.com/sscopazzi/Life_Logger"
+
+# Prose documentation, user manuals and their images, the battery data
+[[annotations]]
+path = ["**.md", "docs/Life_Logger_User_Manual.pdf", "docs/Life_Logger_Quick_Start.pdf",
+        "docs/Life_Logger_Datasheet.pdf", "docs/battery_curve.png"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Aspect Wave LLC"
+SPDX-License-Identifier = "CC-BY-SA-4.0"
+
+# Hardware design source: the case (SolidWorks), the bill of materials, the wiring, stack-up and panel
+# drawings, and the assembly and wiring guide
+[[annotations]]
+path = ["solidworks/**", "hardware/*.csv", "docs/Life_Logger_Assembly_and_Wiring_Guide.pdf",
+        "docs/wiring.png", "docs/stack.png", "docs/panel.png"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Aspect Wave LLC"
+SPDX-License-Identifier = "CERN-OHL-S-2.0"
+
+# Files that can't carry a header: the update file (dashboard + compiled firmware) and the demo's made-up data
+[[annotations]]
+path = [".lbk_files/**", "docs/demo/seed.json"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Aspect Wave LLC"
+SPDX-License-Identifier = "GPL-3.0-or-later"
+
+# The built demo: the dashboard and the pretend box, with the Adafruit GFX 5x7 font (glcdfont.c) inside
+[[annotations]]
+path = "docs/index.html"
+precedence = "aggregate"
+SPDX-FileCopyrightText = ["2026 Aspect Wave LLC", "2012 Adafruit Industries"]
+SPDX-License-Identifier = "GPL-3.0-or-later AND BSD-2-Clause"

@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 Aspect Wave LLC
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Life Logger: two 1.5 MB app slots (so .lbk updates can be written beside the running firmware) and 896 KB of
 # flash storage (LittleFS, label "spiffs": the log, notes, checklist and dashboard; the SD card holds the bulk).
 # Name,   Type, SubType,  Offset,   Size,     Flags

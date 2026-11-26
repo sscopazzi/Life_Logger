@@ -1,5 +1,7 @@
+// SPDX-FileCopyrightText: 2026 Aspect Wave LLC
+// SPDX-License-Identifier: GPL-3.0-or-later
 /*
-  Life Logger  v2.2   life_logger.ino
+  Life Logger  v2.3   life_logger.ino
   Sophie Scopazzi / Aspect Wave LLC
 
   A carry-around box: work orders, daily checklist, calendar, GPS track, house climate,
@@ -37,7 +39,8 @@
   with OTA)" only so its size check allows more than 1.25 MB; the real limit is 1,572,864 bytes.
 
   Wi-Fi: joins the house Wi-Fi whenever it is in range (scans for it every minute or so while away)
-    and always runs its own hotspot. Away from home, connect the phone to the hotspot.
+    and runs its own hotspot (Settings can turn the hotspot off while on the house Wi-Fi; the quick menu's
+    Hotspot on brings it back). Away from home, connect the phone to the hotspot.
 
   Storage:
     SD card: the work-order log /hwo/log.jsonl — one JSON line per change, append-only, so it is also
@@ -77,7 +80,7 @@
     (dashboard + firmware) uploaded from Settings > Firmware, or from the page the box shows when it has
     no dashboard yet (first install over USB).
 
-  Documents: the daily checklist is one small JSON file (/hwo/doc/checklist.json, flash, copied to SD)
+  Documents: the daily checklist is one JSON file of up to 96 kB (/hwo/doc/checklist.json, flash, copied to SD)
     rewritten on each change, so typing and checking never grow the work-order log. Archived days are
     /hwo/cl/YYYY-MM-DD.json, their search index one file a month /hwo/cx/YYYY-MM.json (the dashboard
     keeps it up to date), and imported calendars /hwo/ics/<id>.json, on the SD card when there is one.
@@ -88,7 +91,9 @@
   EEPROM: a once-a-minute "still on" heartbeat, rotated across 240 slots for wear. After a
     power-on the box knows when it was switched off and logs the off period.
 
-  Clock: NTP on the house Wi-Fi, else GPS, else the PCF8523, else set from the phone/laptop.
+  Clock: Automatic: NTP on the house Wi-Fi, else GPS, else the PCF8523, else set from the phone/laptop or by
+    hand (Settings, or the quick menu's Set clock). Manual: only the RTC and what you set; GPS and NTP never change it.
+  Update: while a .lbk or .bin comes in, the OLED shows the update (old --> new version, progress), whatever it was on.
 
   Libraries: RTClib, Adafruit MAX1704X, Adafruit LC709203F, Adafruit BusIO,
              Adafruit SSD1327, Adafruit GFX, Adafruit seesaw, Adafruit BMP3XX, Adafruit Unified Sensor,
@@ -129,22 +134,22 @@
 #define HUB_AP_SSID "Life Logger"         // the starting hotspot, the same on every new box
 #define HUB_AP_PASS "lifelogger-setup"   // shown on the box's JOIN screen; first-boot setup makes you choose your own
 
-#define FW_VERSION "2.2"
+#define FW_VERSION "2.3"
 
 // ===================== USER SETTINGS =====================
-const bool  AP_ALWAYS      = true;          // keep the hotspot up even when on house Wi-Fi
 const uint8_t AP_CHANNEL   = 1;             // hotspot channel when NOT on house Wi-Fi
-const char* MDNS_NAME      = "lifelogger";  // http://lifelogger.local
+const char* MDNS_DEFAULT   = "lifelogger";  // http://lifelogger.local until Settings names the box something else
 const char* TZ_POSIX       = "UTC0";        // until first-boot setup, which starts from the phone's time zone
 const uint8_t  SD_CS          = 10;         // Adalogger FeatherWing SD chip select
 const uint8_t  EE_ADDR        = 0x50;       // I2C EEPROM address
-const uint32_t ENV_LOG_S      = 300;        // climate log interval (s), aligned to the clock
 const uint8_t  ENV_FLASH_DAYS = 10;         // climate days kept in flash when there is no SD card
 const uint32_t OUTAGE_MIN_S   = 120;        // shorter off periods aren't logged (USB flashing, quick resets)
 const uint8_t  GPS_ADDR       = 0x10;       // PA1010D on I2C
-const uint32_t GPS_LOG_S      = 30;         // log a track point at most this often while moving...
-const float    GPS_MOVE_M     = 15.0f;      // ...and only after moving at least this far
-const uint32_t GPS_STILL_S    = 300;        // standing still: one point every 5 min, so a gap means no fix
+// track detail (Settings > The box): a point at most every GPS_LOG_S while moving, and only after moving
+// GPS_MOVE_M; standing still, one every GPS_STILL_S, so a gap means no fix.   Fine / Normal / Coarse
+const uint32_t GPS_LOG_S[3]   = { 10, 30, 120 };
+const float    GPS_MOVE_M[3]  = { 5.0f, 15.0f, 50.0f };
+const uint32_t GPS_STILL_S[3] = { 120, 300, 900 };
 const float    GPS_MAX_HDOP   = 5.0f;       // poorer fixes are not logged
 const uint32_t BATT_READ_S    = 30;
 // Low battery: below BATT_OFF_V for 30 s, and not charging, the box finishes what it is writing and switches
@@ -238,6 +243,8 @@ struct LogMark { uint32_t off, seq; bool undo; };
 struct JobSt { int run = -1, pz = -1, last = -1; uint32_t todayS = 0; };
 struct JobOpt { char a; int k; String t; };              // a: P pause, S stop, R resume, G go (k = jobIds index), A start the last one again
 struct Dev { String n; uint32_t ms; };
+enum AdK : uint8_t { AK_NONE, AK_BMP3, AK_DPS310, AK_BME280, AK_BMP280, AK_LPS22, AK_LPS22DF, AK_SHT3, AK_SHT4, AK_AHT20, AK_LSM6, AK_BNO085, AK_BH1750, AK_TSL2591, AK_PCF8574, AK_AW9523, AK_N };
+struct AddOn { uint8_t k, a; bool on; };
 struct GDay { String d; uint32_t own = 0, x = 0; };
 void jobScanLine(const char* head, uint32_t off);   // JOB TIMER: lines of the log worth reading (time entries, undos)
 void jobNote(const String& line, uint32_t off, uint32_t seq);
@@ -317,14 +324,23 @@ portMUX_TYPE rxMux = portMUX_INITIALIZER_UNLOCKED;
 //  Settings kept on the box (first-boot setup / Settings > Network). Nothing personal is compiled in: the starting
 //  hotspot is public, and there is no default home Wi-Fi and no default box password.
 // ======================================================================
-struct Cfg { String apSsid, apPass, homeSsid, homePass, tz, passSalt, passHash; bool setupDone; int contrast; bool bnwasOn; int bnwasMin; int scrOffMin; bool clHideDone; uint8_t alert; bool btnLed; } cfg;   // alert: 0 sound, 1 vibrate, 2 both; btnLed: the button lights on
+struct Cfg { String apSsid, apPass, homeSsid, homePass, tz, passSalt, passHash; bool setupDone; int contrast; bool bnwasOn; int bnwasMin; int scrOffMin; bool clHideDone; uint8_t alert; bool btnLed;
+             bool clkMan; bool apHomeOff; String mdns; uint8_t gpsDet; int tripAskMin; int envMin; String hwPins, hwAdd, ind; } cfg;   // alert: 0 sound, 1 vibrate, 2 both; btnLed: the button lights on
 const char* CFG_PATH = "/hwo/config.json";
-volatile bool cfgApplyAp = false, cfgApplySta = false;
+volatile bool cfgApplyAp = false, cfgApplySta = false, cfgApplyMdns = false;
 uint32_t cfgApplyAt = 0;
 
+bool mdnsOk(const String& n) {             // a network name: 1-32 of a-z 0-9 -, not starting or ending with -
+  if (!n.length() || n.length() > 32 || n[0] == '-' || n[n.length() - 1] == '-') return false;
+  for (size_t i = 0; i < n.length(); i++) { char c = n[i]; if (!(islower((unsigned char)c) || isdigit((unsigned char)c) || c == '-')) return false; }
+  return true;
+}
+bool envMinOk(int m) { return m == 1 || m == 2 || m == 5 || m == 10 || m == 15; }
+uint32_t envLogS() { return (uint32_t)cfg.envMin * 60; }   // climate log interval (s), aligned to the clock
 void cfgDefaults() {
   cfg.apSsid = HUB_AP_SSID; cfg.apPass = HUB_AP_PASS; cfg.homeSsid = ""; cfg.homePass = ""; cfg.passSalt = ""; cfg.passHash = "";
   cfg.tz = TZ_POSIX; cfg.setupDone = false; cfg.contrast = 0x7F; cfg.bnwasOn = false; cfg.bnwasMin = 30; cfg.scrOffMin = 5; cfg.clHideDone = false; cfg.alert = 2; cfg.btnLed = true;
+  cfg.clkMan = false; cfg.apHomeOff = false; cfg.mdns = MDNS_DEFAULT; cfg.gpsDet = 1; cfg.tripAskMin = 60; cfg.envMin = 5;
 }
 void cfgLoad() {
   cfgDefaults();
@@ -340,6 +356,13 @@ void cfgLoad() {
   cfg.clHideDone = d["clHideDone"] | false;
   cfg.alert = constrain((int)(d["alert"] | 2), 0, 2);
   cfg.btnLed = d["btnLed"] | true;
+  cfg.hwPins = d["hwPins"] | ""; cfg.hwAdd = d["hwAdd"] | ""; cfg.ind = d["ind"] | "";   // ind: Settings > Indicator lights (JSON)        // Settings > Pin mapping, Add-ons (JSON)
+  cfg.clkMan = d["clkMan"] | false;                                   // true: GPS and internet time never change the clock
+  cfg.apHomeOff = d["apHomeOff"] | false;                             // true: the hotspot is off while on the house Wi-Fi
+  cfg.mdns = d["mdns"] | MDNS_DEFAULT; if (!mdnsOk(cfg.mdns)) cfg.mdns = MDNS_DEFAULT;
+  cfg.gpsDet = constrain((int)(d["gpsDet"] | 1), 0, 2);
+  cfg.tripAskMin = constrain((int)(d["tripAskMin"] | 60), 10, 480);
+  cfg.envMin = d["envMin"] | 5; if (!envMinOk(cfg.envMin)) cfg.envMin = 5;
   cfg.passSalt = d["passSalt"] | ""; cfg.passHash = d["passHash"] | "";
 }
 bool cfgSave() {
@@ -347,6 +370,8 @@ bool cfgSave() {
   d["apSsid"] = cfg.apSsid; d["apPass"] = cfg.apPass; d["homeSsid"] = cfg.homeSsid; d["homePass"] = cfg.homePass;
   d["tz"] = cfg.tz; d["setupDone"] = cfg.setupDone; d["contrast"] = cfg.contrast; d["bnwasOn"] = cfg.bnwasOn; d["bnwasMin"] = cfg.bnwasMin; d["scrOffMin"] = cfg.scrOffMin; d["clHideDone"] = cfg.clHideDone; d["alert"] = cfg.alert; d["btnLed"] = cfg.btnLed;
   d["passSalt"] = cfg.passSalt; d["passHash"] = cfg.passHash;
+  d["hwPins"] = cfg.hwPins; d["hwAdd"] = cfg.hwAdd; d["ind"] = cfg.ind;
+  d["clkMan"] = cfg.clkMan; d["apHomeOff"] = cfg.apHomeOff; d["mdns"] = cfg.mdns; d["gpsDet"] = cfg.gpsDet; d["tripAskMin"] = cfg.tripAskMin; d["envMin"] = cfg.envMin;
   String out; serializeJson(d, out);
   String tmp = String(CFG_PATH) + ".tmp";
   File f = LittleFS.open(tmp, FILE_WRITE);
@@ -777,18 +802,22 @@ void syncSdMirror() {
     else refreshFlashCopy();
   } else if (s > 0 && s != f) refreshFlashCopy();            // the card is ahead (or a new board): flash takes a copy if it fits
   flashCopy = fileSize(LittleFS, LOG_PATH) == fileSize(SD, LOG_PATH) && fileSize(SD, LOG_PATH) > 0;
-  // checklist: restore from the card if flash has none, otherwise keep the card's copy current
-  const char* CLP = "/hwo/doc/checklist.json";
-  if (!LittleFS.exists(CLP) && SD.exists(CLP)) copyFile(SD, LittleFS, CLP);
-  else if (LittleFS.exists(CLP)) copyFile(LittleFS, SD, CLP);
+  // the checklist, the box's screen settings and the Planner's plan: restore from the card if flash has none,
+  // otherwise keep the card's copy current (it went stale if any of them changed while the card was out)
+  for (const char* P : {"/hwo/doc/checklist.json", "/hwo/doc/oled.json", "/hwo/doc/plan.json"}) {
+    if (!LittleFS.exists(P) && SD.exists(P)) copyFile(SD, LittleFS, P);
+    else if (LittleFS.exists(P)) copyFile(LittleFS, SD, P);
+  }
   syncNotes();
   // files kept in flash while there was no card: move them to the card
   moveDirToSd("/hwo/cl", false);
   moveDirToSd("/hwo/na", false);
   moveDirToSd("/hwo/nh", false);
   moveDirToSd("/hwo/ics", false);
+  moveDirToSd("/hwo/pl", false);   // plans put away while the card was out
   moveDirToSd("/gps", true);       // a day's track may already be on the card: append
   moveDirToSd("/baro", true);
+  moveDirToSd("/env", true);       // climate kept while the card was out: onto the card before flash prunes it after 10 days
 }
 
 bool startSD() {
@@ -1177,7 +1206,7 @@ void envLogTick() {
   fs::FS* fs = envFS();
   if (!fs) return;
   time_t t = time(nullptr);
-  uint32_t slot = (uint32_t)t / ENV_LOG_S;
+  uint32_t slot = (uint32_t)t / envLogS();
   if (slot == lastEnvSlot) return;
   bool first = (lastEnvSlot == 0);
   lastEnvSlot = slot;
@@ -1200,7 +1229,386 @@ void envLogTick() {
     f.print(csvNum(n.vbat, 3)); f.print(','); f.print(csvNum(n.soc, 1)); f.print(',');
     f.println(n.rssi);
   }
+  envBoxRow(f, u, l);                      // the box's own temperature and humidity (Add-ons), as a node called Box
   f.close();
+}
+
+// ======================================================================
+//  Pins and add-ons (Settings > Pin mapping, Add-ons)
+//  Pins: each button, light and the buzzer, and up to four extra buttons, on a Feather pin or on an I/O
+//    expander (PCF8574 at the address you set; AW9523, found by its ID). A pin is written "" (none),
+//    "f<GPIO>" (Feather), "p<0-7>" (PCF8574) or "a<0-15>" (AW9523: P0_0-7 = 0-7, P1_0-7 = 8-15).
+//    Buttons connect the pin to GND (Feather pins have pull-ups; AW9523 pins need a 10k pull-up to 3V).
+//    Lights: Feather pins dim with PWM, AW9523 pins drive LEDs with their own current (LED mode),
+//    PCF8574 pins only switch, wired LED to 3V through a resistor (the pin sinks it: low = on).
+//    The buzzer needs Feather pins (A, and B in opposite phase; B none drives the piezo from A to GND).
+//  Add-ons: what a scan of the I2C bus finds at start-up (and on Scan); each can be turned off.
+//    Pressure  BMP388/390, DPS310, BME280, BMP280, LPS22    -> the pressure track (/baro) and BAROGRAPH
+//    Temp + RH SHT3x, SHT4x, AHT20, BME280                  -> a "Box" row in the climate files, like a node
+//    IMU       LSM6DS (LSM6DSOX/DS3/DSL, ISM330), BNO085     -> wake the screen when picked up, auto-rotate it
+//    Light     TSL2591, BH1750 (no ID: turned on at 0x23 or 0x5C) -> lux on the status and the screen's line
+//    (A VEML7700 can't share the bus: its only address, 0x10, is the GPS's.)
+//  Changes are saved in config.json (hwPins, hwAdd) and take effect after a restart.
+// ======================================================================
+const uint8_t FPINS[] = { 5, 6, 8, 9, 11, 12, 13, 14, 15, 17, 18, 38, 39 };   // free: not I2C, SPI, the SD card's CS or USB sense
+const char* fpinName(uint8_t g) {
+  switch (g) { case 18: return "A0"; case 17: return "A1"; case 15: return "A3"; case 14: return "A4"; case 8: return "A5";
+               case 38: return "RX"; case 39: return "TX"; case 13: return "13 (red LED)"; default: return nullptr; }
+}
+struct HwPins { String back = "f11", sel = "f9", backLed = "f18", selLed = "f17", buzA = "f5", buzB = "f6", xbP[4], xbA[4], ind[2]; } hp;   // ind: the two indicator lights (none by default)
+uint8_t pcfAddr = 0, awAddr = 0;                           // 0: none
+bool pcfOK = false, awOK = false;
+uint8_t pcfOut = 0xFF, pcfIn = 0xFF, awLast[16]; uint16_t awIn = 0xFFFF;
+bool imuWoke = false;                                       // the IMU woke the screen (nothing touched since)
+uint32_t lightTestMs = 0;                                   // Settings' Test lights: each light 1 s in turn (BACK, SELECT, then the indicators)
+int8_t indCur[2] = { -1, -1 };                              // the rule showing now (-1: none)
+uint32_t indMask = 0, indAt = 0;
+const char* XB_ACT[] = { "home", "clock", "job", "mark", "trip", "off", "phone", "beep", "bnwas", "alert", "apon", "setclk", "gps" };
+
+bool i2cPing(uint8_t a) { Wire.beginTransmission(a); return Wire.endTransmission() == 0; }
+int rd8(uint8_t a, uint8_t r) { Wire.beginTransmission(a); Wire.write(r); if (Wire.endTransmission(false) != 0) return -1; if (Wire.requestFrom(a, (uint8_t)1) != 1) return -1; return Wire.read(); }
+bool rdN(uint8_t a, uint8_t r, uint8_t* b, uint8_t n) { Wire.beginTransmission(a); Wire.write(r); if (Wire.endTransmission(false) != 0) return false; if (Wire.requestFrom(a, n) != n) return false; for (uint8_t i = 0; i < n; i++) b[i] = Wire.read(); return true; }
+bool wr8(uint8_t a, uint8_t r, uint8_t v) { Wire.beginTransmission(a); Wire.write(r); Wire.write(v); return Wire.endTransmission() == 0; }
+bool wrCmd(uint8_t a, const uint8_t* c, uint8_t n) { Wire.beginTransmission(a); Wire.write(c, n); return Wire.endTransmission() == 0; }
+uint8_t crc8(const uint8_t* d, int n) { uint8_t c = 0xFF; for (int i = 0; i < n; i++) { c ^= d[i]; for (int b = 0; b < 8; b++) c = c & 0x80 ? (c << 1) ^ 0x31 : c << 1; } return c; }   // Sensirion
+
+// ---- pins ----
+char pinKind(const String& c) { return c.length() ? c[0] : 0; }
+int pinNum(const String& c) { return c.length() > 1 ? c.substring(1).toInt() : -1; }
+bool pinValid(const String& c, bool feathOnly) {
+  if (!c.length()) return true;
+  char k = pinKind(c); int n = pinNum(c);
+  for (size_t i = 1; i < c.length(); i++) if (!isdigit((unsigned char)c[i])) return false;
+  if (k == 'f') { for (uint8_t g : FPINS) if (g == n) return true; return false; }
+  if (feathOnly) return false;
+  if (k == 'p') return n >= 0 && n <= 7 && pcfAddr;
+  if (k == 'a') return n >= 0 && n <= 15 && awAddr;
+  return false;
+}
+void pcfWrite() { if (pcfOK) { Wire.beginTransmission(pcfAddr); Wire.write(pcfOut); Wire.endTransmission(); } }
+void awPinMode(int n, bool input, bool led) {               // AW9523: input, GPIO output or LED (current) mode
+  uint8_t cr = n < 8 ? 0x04 : 0x05, mr = n < 8 ? 0x12 : 0x13, bit = 1 << (n & 7);
+  int c = rd8(awAddr, cr), m = rd8(awAddr, mr); if (c < 0 || m < 0) return;
+  wr8(awAddr, cr, input ? (c | bit) : (c & ~bit));
+  wr8(awAddr, mr, led ? (m & ~bit) : (m | bit));
+}
+uint8_t awDimReg(int n) { return n < 8 ? 0x24 + n : n < 12 ? 0x20 + (n - 8) : 0x2C + (n - 12); }
+void pinInput(const String& c) {
+  char k = pinKind(c); int n = pinNum(c);
+  if (k == 'f') pinMode(n, INPUT_PULLUP);
+  else if (k == 'p' && pcfOK) { pcfOut |= 1 << n; pcfWrite(); }   // high = input with the chip's weak pull-up
+  else if (k == 'a' && awOK) awPinMode(n, true, false);
+}
+uint8_t ledCh = 4;                                          // LEDC channels from 4 up (0 and 1 are the buzzer's)
+void pinLedStart(const String& c) {
+  char k = pinKind(c); int n = pinNum(c);
+  if (k == 'f') { ledcAttachChannel(n, 5000, 8, ledCh++); ledcWrite(n, 0); }
+  else if (k == 'p' && pcfOK) { pcfOut |= 1 << n; pcfWrite(); }   // off (the pin sinks the LED: low = on)
+  else if (k == 'a' && awOK) { awPinMode(n, false, true); wr8(awAddr, awDimReg(n), 0); awLast[n] = 0; }
+}
+void pinLevel(const String& c, uint8_t v) {                 // a light, 0-255
+  char k = pinKind(c); int n = pinNum(c);
+  if (k == 'f') ledcWrite(n, v);
+  else if (k == 'p' && pcfOK) { uint8_t o = v ? (pcfOut & ~(1 << n)) : (pcfOut | (1 << n)); if (o != pcfOut) { pcfOut = o; pcfWrite(); } }
+  else if (k == 'a' && awOK) { if (awLast[n] != v) { awLast[n] = v; wr8(awAddr, awDimReg(n), v); } }
+}
+bool pinDown(const String& c) {                             // a button: pressed connects the pin to GND
+  char k = pinKind(c); int n = pinNum(c);
+  if (k == 'f') return digitalRead(n) == LOW;
+  if (k == 'p') return pcfOK && !(pcfIn >> n & 1);
+  if (k == 'a') return awOK && !(awIn >> n & 1);
+  return false;
+}
+bool usesExp(char k) { for (const String* s : { &hp.back, &hp.sel, &hp.xbP[0], &hp.xbP[1], &hp.xbP[2], &hp.xbP[3] }) if (pinKind(*s) == k) return true; return false; }
+void expRead() {                                            // the expanders' inputs, once per screen tick
+  if (pcfOK && usesExp('p') && Wire.requestFrom(pcfAddr, (uint8_t)1) == 1) pcfIn = Wire.read();
+  uint8_t b[2]; if (awOK && usesExp('a') && rdN(awAddr, 0x00, b, 2)) awIn = b[0] | (b[1] << 8);
+}
+void hwPinsLoad(const String& js) {
+  if (!js.length()) return;
+  JsonDocument d; if (deserializeJson(d, js)) return;
+  const char* K[] = { "back", "sel", "backLed", "selLed", "buzA", "buzB" }; String* R[] = { &hp.back, &hp.sel, &hp.backLed, &hp.selLed, &hp.buzA, &hp.buzB };
+  for (int i = 0; i < 6; i++) if (d[K[i]].is<const char*>()) *R[i] = (const char*)d[K[i]];
+  JsonArray x = d["xb"].as<JsonArray>(); int i = 0;
+  for (JsonVariant v : x) { if (i >= 4) break; hp.xbP[i] = v[0] | ""; hp.xbA[i] = v[1] | ""; i++; }
+  i = 0; for (JsonVariant v : d["ind"].as<JsonArray>()) { if (i >= 2) break; hp.ind[i++] = v | ""; }
+}
+String hwPinsJson() {
+  String s = "{\"back\":" + jStr(hp.back) + ",\"sel\":" + jStr(hp.sel) + ",\"backLed\":" + jStr(hp.backLed) + ",\"selLed\":" + jStr(hp.selLed) +
+             ",\"buzA\":" + jStr(hp.buzA) + ",\"buzB\":" + jStr(hp.buzB) + ",\"xb\":[";
+  for (int i = 0; i < 4; i++) s += String(i ? "," : "") + "[" + jStr(hp.xbP[i]) + "," + jStr(hp.xbA[i]) + "]";
+  return s + "],\"ind\":[" + jStr(hp.ind[0]) + "," + jStr(hp.ind[1]) + "]}";
+}
+
+// ---- add-ons ----
+const char* AK_NAME[] = { "", "BMP388/390", "DPS310", "BME280", "BMP280", "LPS22", "LPS22DF", "SHT3x", "SHT4x", "AHT20", "LSM6DS", "BNO085", "BH1750", "TSL2591", "PCF8574", "AW9523" };
+const char* AK_KEY[]  = { "", "bmp3", "dps310", "bme280", "bmp280", "lps22", "lps22df", "sht3", "sht4", "aht20", "lsm6", "bno085", "bh1750", "tsl2591", "pcf8574", "aw9523" };
+const char* AK_WHAT[] = { "", "press", "press", "press+th", "press", "press", "press", "th", "th", "th", "imu", "imu", "light", "light", "io", "io" };
+std::vector<AddOn> addons;
+String addOff;                                              // "key@hex,..." turned off in Settings
+uint8_t bhAddr = 0;                                         // the BH1750's address if you turned it on (it has no ID to find it by)
+uint8_t imuMount = 0; bool imuFlip = false, imuWake = true, imuRot = true;   // X arrow: 0 to the screen's top, 1 right, 2 bottom, 3 left
+String scanList;                                            // every address that answered, "0x10,0x36,…"
+bool isOff(uint8_t k, uint8_t a) { char t[16]; snprintf(t, sizeof t, "%s@%02x", AK_KEY[k], a); return addOff.indexOf(t) >= 0; }
+void addScan(bool soft = false) {                            // soft: Settings' Scan while running: what's in use keeps its name, nothing is reset
+  std::vector<AddOn> was = addons;
+  addons.clear(); scanList = "";
+  for (uint8_t a = 0x08; a < 0x78; a++) if (i2cPing(a)) { char t[6]; snprintf(t, sizeof t, "0x%02X", a); scanList += (scanList.length() ? "," : "") + String(t); }
+  auto add = [](uint8_t k, uint8_t a) { addons.push_back({ k, a, !isOff(k, a) }); };
+  for (uint8_t a : { 0x77, 0x76 }) if (i2cPing(a)) {
+    bool kept = false; if (soft) for (const AddOn& x : was) if (x.a == a && (x.k == AK_BMP3 || x.k == AK_DPS310)) { add(x.k, a); kept = true; }
+    if (kept) continue;
+    int id = rd8(a, 0xD0);
+    if (id == 0x60) { add(AK_BME280, a); continue; }
+    if (id == 0x58) { add(AK_BMP280, a); continue; }
+    if (!soft) { wr8(a, 0x0C, 0x09); delay(40); }            // a DPS310's soft reset (ignored by the others): its data registers read 0 after it
+    int b3 = rd8(a, 0x00);
+    if (b3 == 0x50 || b3 == 0x60) add(AK_BMP3, a);
+    else if (rd8(a, 0x0D) == 0x10) add(AK_DPS310, a);
+  }
+  for (uint8_t a : { 0x5D, 0x5C }) if (i2cPing(a)) {
+    int w = rd8(a, 0x0F);
+    if (w == 0xB1 || w == 0xB3) add(AK_LPS22, a); else if (w == 0xB4) add(AK_LPS22DF, a);
+    else if (bhAddr == a) add(AK_BH1750, a);
+  }
+  for (uint8_t a : { 0x44, 0x45 }) if (i2cPing(a)) {
+    uint8_t b[6]; const uint8_t s4[] = { 0x89 }, s3[] = { 0xF3, 0x2D };
+    bool four = wrCmd(a, s4, 1) && (delay(2), Wire.requestFrom(a, (uint8_t)6) == 6);
+    if (four) { for (int i = 0; i < 6; i++) b[i] = Wire.read(); four = crc8(b, 2) == b[2] && crc8(b + 3, 2) == b[5]; }
+    if (four) { add(AK_SHT4, a); continue; }
+    if (wrCmd(a, s3, 2) && (delay(2), Wire.requestFrom(a, (uint8_t)3) == 3)) { for (int i = 0; i < 3; i++) b[i] = Wire.read(); if (crc8(b, 2) == b[2]) add(AK_SHT3, a); }
+  }
+  if (i2cPing(0x38) && Wire.requestFrom((uint8_t)0x38, (uint8_t)1) == 1) { uint8_t st = Wire.read(); if (!(st & 0x80) && (st & 0x08)) add(AK_AHT20, 0x38); }   // (the knob can be at 0x38 too: its answer isn't an AHT20's)
+  for (uint8_t a : { 0x6A, 0x6B }) if (i2cPing(a)) { int w = rd8(a, 0x0F); if (w == 0x69 || w == 0x6A || w == 0x6B || w == 0x6C) add(AK_LSM6, a); }
+  for (uint8_t a : { 0x4A, 0x4B }) if (i2cPing(a)) add(AK_BNO085, a);
+  if (i2cPing(0x29) && rd8(0x29, 0xA0 | 0x12) == 0x50) add(AK_TSL2591, 0x29);
+  if (bhAddr == 0x23 && pcfAddr != 0x23 && i2cPing(0x23)) add(AK_BH1750, 0x23);
+  for (uint8_t a = 0x58; a <= 0x5B; a++) if (i2cPing(a) && rd8(a, 0x10) == 0x23) { add(AK_AW9523, a); break; }
+  if (pcfAddr && i2cPing(pcfAddr)) add(AK_PCF8574, pcfAddr);
+}
+const AddOn* addFirst(const char* what, std::initializer_list<uint8_t> order) {   // the first of these kinds that's on
+  for (uint8_t k : order) for (const AddOn& x : addons) if (x.k == k && x.on) return &x;
+  return nullptr;
+}
+void hwAddLoad(const String& js) {
+  if (!js.length()) return;
+  JsonDocument d; if (deserializeJson(d, js)) return;
+  addOff = d["off"] | ""; bhAddr = d["bh"] | 0; pcfAddr = d["pcf"] | 0;
+  if (bhAddr != 0x23 && bhAddr != 0x5C) bhAddr = 0;
+  if (pcfAddr < 0x20 || pcfAddr > 0x27) pcfAddr = 0;
+  imuMount = (uint8_t)constrain((int)(d["imuM"] | 0), 0, 3); imuFlip = d["imuF"] | false; imuWake = d["imuW"] | true; imuRot = d["imuR"] | true;
+}
+
+// ---- the sensors ----
+// pressure (and its temperature): the first found of BMP3, DPS310, LPS22, BME280, BMP280
+uint8_t prK = 0, prA = 0;
+struct { uint16_t T1; int16_t T2, T3; uint16_t P1; int16_t P2, P3, P4, P5, P6, P7, P8, P9; uint8_t H1, H3; int16_t H2, H4, H5; int8_t H6; } bmeC;
+uint8_t bmeA = 0; float bmeRH = NAN;
+bool bmeStart(uint8_t a, bool hum) {
+  uint8_t c[26], h[7];
+  wr8(a, 0xE0, 0xB6); delay(5);
+  if (!rdN(a, 0x88, c, 26)) return false;
+  auto u16 = [&](int i) { return (uint16_t)(c[i] | c[i + 1] << 8); };
+  bmeC.T1 = u16(0); bmeC.T2 = (int16_t)u16(2); bmeC.T3 = (int16_t)u16(4); bmeC.P1 = u16(6);
+  int16_t* P[] = { &bmeC.P2, &bmeC.P3, &bmeC.P4, &bmeC.P5, &bmeC.P6, &bmeC.P7, &bmeC.P8, &bmeC.P9 };
+  for (int i = 0; i < 8; i++) *P[i] = (int16_t)u16(8 + 2 * i);
+  bmeC.H1 = c[25];
+  if (hum && rdN(a, 0xE1, h, 7)) {
+    bmeC.H2 = (int16_t)(h[0] | h[1] << 8); bmeC.H3 = h[2];
+    bmeC.H4 = (int16_t)((int8_t)h[3] * 16 | (h[4] & 0x0F)); bmeC.H5 = (int16_t)((int8_t)h[5] * 16 | (h[4] >> 4)); bmeC.H6 = (int8_t)h[6];
+    wr8(a, 0xF2, 0x01);                                      // humidity x1
+  }
+  wr8(a, 0xF5, 0xA8);                                        // 1 s standby, filter x4
+  wr8(a, 0xF4, 0x57);                                        // temperature x2, pressure x16, normal mode
+  bmeA = a; return true;
+}
+bool bmeRead(float& hpa, float& c, float* rh) {
+  uint8_t b[8]; if (!rdN(bmeA, 0xF7, b, 8)) return false;
+  int32_t aP = (b[0] << 12) | (b[1] << 4) | (b[2] >> 4), aT = (b[3] << 12) | (b[4] << 4) | (b[5] >> 4), aH = (b[6] << 8) | b[7];
+  if (aT == 0x80000) return false;
+  double v1 = (aT / 16384.0 - bmeC.T1 / 1024.0) * bmeC.T2, v2 = (aT / 131072.0 - bmeC.T1 / 8192.0); v2 = v2 * v2 * bmeC.T3;
+  double tf = v1 + v2; c = tf / 5120.0;
+  v1 = tf / 2.0 - 64000.0; v2 = v1 * v1 * bmeC.P6 / 32768.0; v2 = v2 + v1 * bmeC.P5 * 2.0; v2 = v2 / 4.0 + bmeC.P4 * 65536.0;
+  v1 = (bmeC.P3 * v1 * v1 / 524288.0 + bmeC.P2 * v1) / 524288.0; v1 = (1.0 + v1 / 32768.0) * bmeC.P1;
+  if (v1 == 0) return false;
+  double p = 1048576.0 - aP; p = (p - v2 / 4096.0) * 6250.0 / v1;
+  v1 = bmeC.P9 * p * p / 2147483648.0; v2 = p * bmeC.P8 / 32768.0; p = p + (v1 + v2 + bmeC.P7) / 16.0;
+  hpa = p / 100.0;
+  if (rh && aH != 0x8000) {
+    double h = tf - 76800.0;
+    h = (aH - (bmeC.H4 * 64.0 + bmeC.H5 / 16384.0 * h)) * (bmeC.H2 / 65536.0 * (1.0 + bmeC.H6 / 67108864.0 * h * (1.0 + bmeC.H3 / 67108864.0 * h)));
+    h = h * (1.0 - bmeC.H1 * h / 524288.0);
+    *rh = constrain((float)h, 0.0f, 100.0f);
+  }
+  return true;
+}
+struct { float c0, c1, c00, c10, c01, c11, c20, c21, c30; } dpsC;
+bool dpsStart(uint8_t a) {
+  for (int i = 0; i < 50 && (rd8(a, 0x08) & 0xC0) != 0xC0; i++) delay(10);   // coefficients and sensor ready
+  uint8_t c[18]; if (!rdN(a, 0x10, c, 18)) return false;
+  auto s = [](int32_t v, int bits) { return v & (1L << (bits - 1)) ? v - (1L << bits) : v; };
+  dpsC.c0 = s((c[0] << 4) | (c[1] >> 4), 12); dpsC.c1 = s(((c[1] & 0x0F) << 8) | c[2], 12);
+  dpsC.c00 = s(((int32_t)c[3] << 12) | (c[4] << 4) | (c[5] >> 4), 20); dpsC.c10 = s(((int32_t)(c[5] & 0x0F) << 16) | (c[6] << 8) | c[7], 20);
+  dpsC.c01 = s((c[8] << 8) | c[9], 16); dpsC.c11 = s((c[10] << 8) | c[11], 16); dpsC.c20 = s((c[12] << 8) | c[13], 16);
+  dpsC.c21 = s((c[14] << 8) | c[15], 16); dpsC.c30 = s((c[16] << 8) | c[17], 16);
+  // the temperature quirk some DPS310s need for a sane reading
+  wr8(a, 0x0E, 0xA5); wr8(a, 0x0F, 0x96); wr8(a, 0x62, 0x02); wr8(a, 0x0E, 0x00); wr8(a, 0x0F, 0x00);
+  int src = rd8(a, 0x28); uint8_t ext = src >= 0 && (src & 0x80) ? 0x80 : 0;
+  wr8(a, 0x06, 0x26);                                        // pressure: 4 per second, x64 oversampling
+  wr8(a, 0x07, ext | 0x20);                                  // temperature: 4 per second, the sensor the coefficients came from
+  wr8(a, 0x09, 0x04);                                        // pressure shift (oversampling > 8)
+  wr8(a, 0x08, 0x07);                                        // continuous pressure and temperature
+  return true;
+}
+bool dpsRead(uint8_t a, float& hpa, float& c) {
+  uint8_t b[6]; if (!rdN(a, 0x00, b, 6)) return false;
+  auto s24 = [](uint8_t* p) { int32_t v = ((int32_t)p[0] << 16) | (p[1] << 8) | p[2]; return v & 0x800000 ? v - 0x1000000 : v; };
+  float t = s24(b + 3) / 524288.0f, pr = s24(b) / 1040384.0f;   // scale factors for x1 temperature and x64 pressure
+  c = dpsC.c0 * 0.5f + dpsC.c1 * t;
+  hpa = (dpsC.c00 + pr * (dpsC.c10 + pr * (dpsC.c20 + pr * dpsC.c30)) + t * dpsC.c01 + t * pr * (dpsC.c11 + pr * dpsC.c21)) / 100.0f;
+  return true;
+}
+bool lpsRead(uint8_t a, float& hpa, float& c) {
+  uint8_t b[5]; if (!rdN(a, 0x28, b, 5)) return false;
+  int32_t p = (int32_t)((uint32_t)b[2] << 16 | b[1] << 8 | b[0]); if (p & 0x800000) p -= 0x1000000;
+  hpa = p / 4096.0f; c = (int16_t)(b[4] << 8 | b[3]) / 100.0f; return true;
+}
+// temperature and humidity in the box: the first of SHT4x, SHT3x, AHT20, BME280; read every 30 s, started one tick and read the next
+uint8_t thK = 0, thA = 0; float boxC = NAN, boxRH = NAN; uint32_t boxThMs = 0, thStartMs = 0; bool thBusy = false;
+void thTick() {
+  if (!thK) return;
+  uint32_t now = millis();
+  if (!thBusy) {
+    if (boxThMs && now - boxThMs < 30000) return;
+    if (thK == AK_BME280) { float h, c, rh; if (bmeRead(h, c, &rh)) { boxC = c; boxRH = rh; } boxThMs = now ? now : 1; return; }
+    const uint8_t s4[] = { 0xFD }, s3[] = { 0x24, 0x00 }, aht[] = { 0xAC, 0x33, 0x00 };
+    bool ok = thK == AK_SHT4 ? wrCmd(thA, s4, 1) : thK == AK_SHT3 ? wrCmd(thA, s3, 2) : wrCmd(thA, aht, 3);
+    if (ok) { thBusy = true; thStartMs = now; } else boxThMs = now;
+    return;
+  }
+  if (now - thStartMs < (thK == AK_AHT20 ? 90u : 25u)) return;
+  thBusy = false; boxThMs = now ? now : 1;
+  uint8_t b[6]; if (Wire.requestFrom(thA, (uint8_t)6) != 6) return;
+  for (int i = 0; i < 6; i++) b[i] = Wire.read();
+  if (thK == AK_AHT20) {
+    if (b[0] & 0x80) return;                                 // still busy
+    uint32_t h = ((uint32_t)b[1] << 12) | (b[2] << 4) | (b[3] >> 4), t = ((uint32_t)(b[3] & 0x0F) << 16) | (b[4] << 8) | b[5];
+    boxRH = h * 100.0f / 1048576.0f; boxC = t * 200.0f / 1048576.0f - 50.0f; return;
+  }
+  if (crc8(b, 2) != b[2] || crc8(b + 3, 2) != b[5]) return;
+  uint16_t t = b[0] << 8 | b[1], h = b[3] << 8 | b[4];
+  boxC = -45.0f + 175.0f * t / 65535.0f;
+  boxRH = thK == AK_SHT4 ? constrain(-6.0f + 125.0f * h / 65535.0f, 0.0f, 100.0f) : 100.0f * h / 65535.0f;
+}
+bool boxThFresh() { return thK && boxThMs && millis() - boxThMs < 120000 && !isnan(boxC); }
+// light: TSL2591 or BH1750, every 5 s
+uint8_t lxK = 0, lxA = 0; float boxLux = NAN; uint32_t lxMs = 0;
+void lxStart() {
+  if (lxK == AK_TSL2591) { wr8(lxA, 0xA0 | 0x00, 0x03); wr8(lxA, 0xA0 | 0x01, 0x10); }   // on, medium gain, 100 ms
+  else if (lxK == AK_BH1750) { const uint8_t on[] = { 0x01 }, hr[] = { 0x10 }; wrCmd(lxA, on, 1); wrCmd(lxA, hr, 1); }   // continuous, 1 lx
+}
+void lxTick() {
+  if (!lxK || millis() - lxMs < 5000) return;
+  lxMs = millis();
+  if (lxK == AK_TSL2591) {
+    uint8_t b[4]; if (!rdN(lxA, 0xA0 | 0x14, b, 4)) return;
+    float c0 = b[0] | b[1] << 8, c1 = b[2] | b[3] << 8;
+    if (c0 >= 65535 || c1 >= 65535) { boxLux = NAN; return; }   // too bright for this gain
+    boxLux = c0 <= 0 ? 0 : max(0.0f, (c0 - c1) * (1.0f - c1 / c0) / (100.0f * 25.0f / 408.0f));
+  } else if (Wire.requestFrom(lxA, (uint8_t)2) == 2) { uint16_t r = Wire.read() << 8; r |= Wire.read(); boxLux = r / 1.2f; }
+}
+// IMU: gravity in its own frame (g), every 100 ms
+uint8_t imK = 0, imA = 0; float imG[3] = { NAN, NAN, NAN }; uint32_t imMs = 0, imSeen = 0;
+uint8_t bnoSeq[6];
+bool bnoSend(uint8_t ch, const uint8_t* d, uint16_t n) {
+  uint16_t L = n + 4; Wire.beginTransmission(imA);
+  Wire.write(L & 0xFF); Wire.write(L >> 8); Wire.write(ch); Wire.write(bnoSeq[ch]++); Wire.write(d, n);
+  return Wire.endTransmission() == 0;
+}
+int bnoRead(uint8_t& ch, uint8_t* p, int pmax) {            // one packet: its first pmax payload bytes (the rest read and dropped)
+  if (Wire.requestFrom(imA, (uint8_t)4) != 4) return -1;
+  uint8_t h[4]; for (int i = 0; i < 4; i++) h[i] = Wire.read();
+  int L = (h[0] | h[1] << 8) & 0x7FFF; ch = h[2];
+  if (L <= 4) return 0;
+  int left = L - 4, got = 0;
+  while (left > 0) {
+    int n = min(left, 124);
+    if (Wire.requestFrom(imA, (uint8_t)(n + 4)) != n + 4) return -1;
+    for (int i = 0; i < 4; i++) Wire.read();                 // each piece starts with the header again
+    for (int i = 0; i < n; i++) { uint8_t v = Wire.read(); if (got < pmax) p[got] = v; got++; }
+    left -= n;
+  }
+  return min(got, pmax);
+}
+void bnoEnable() {                                          // gravity, 10 a second
+  const uint32_t us = 100000;
+  uint8_t c[17] = { 0xFD, 0x06, 0, 0, 0, (uint8_t)us, (uint8_t)(us >> 8), (uint8_t)(us >> 16), (uint8_t)(us >> 24) };
+  bnoSend(2, c, 17);
+}
+void imStart() {
+  if (imK == AK_LSM6) { wr8(imA, 0x12, 0x44); wr8(imA, 0x10, 0x40); }   // block update, auto-increment; accelerometer 104 Hz, +-2 g
+  else if (imK == AK_BNO085) {
+    uint8_t p[32], ch;
+    for (int i = 0; i < 12; i++) { if (bnoRead(ch, p, 32) <= 0) delay(20); }   // its start-up messages
+    bnoEnable();
+  }
+}
+void imRead() {
+  if (!imK || millis() - imMs < 100) return;
+  imMs = millis();
+  if (imK == AK_LSM6) {
+    uint8_t b[6]; if (!rdN(imA, 0x28, b, 6)) return;
+    for (int i = 0; i < 3; i++) imG[i] = (int16_t)(b[2 * i] | b[2 * i + 1] << 8) * 0.061e-3f;
+    imSeen = millis(); return;
+  }
+  uint8_t p[32], ch;
+  for (int k = 0; k < 4; k++) {
+    int n = bnoRead(ch, p, 32); if (n <= 0) break;
+    if (ch == 3 && n >= 15 && p[0] == 0xFB && (p[5] == 0x06 || p[5] == 0x01)) {
+      for (int i = 0; i < 3; i++) imG[i] = (int16_t)(p[9 + 2 * i] | p[10 + 2 * i] << 8) / 256.0f / 9.80665f;
+      imSeen = millis();
+    }
+  }
+  if (imSeen == 0 || millis() - imSeen > 5000) { static uint32_t last = 0; if (millis() - last > 5000) { last = millis(); bnoEnable(); } }   // no reports: ask again
+}
+
+void hwStart() {
+  memset(awLast, 0xFF, sizeof awLast);
+  addScan();
+  for (const AddOn& x : addons) if (x.k == AK_AW9523 && x.on) { awAddr = x.a; awOK = true; wr8(awAddr, 0x7F, 0x00); delay(2); wr8(awAddr, 0x11, 0x10); }   // reset; P0 push-pull
+  for (const AddOn& x : addons) if (x.k == AK_PCF8574 && x.on) { pcfOK = true; pcfWrite(); }
+  if (const AddOn* p = addFirst("press", { AK_BMP3, AK_DPS310, AK_LPS22, AK_LPS22DF, AK_BME280, AK_BMP280 })) {
+    prK = p->k; prA = p->a;
+    if (prK == AK_DPS310 && !dpsStart(prA)) prK = 0;
+    else if ((prK == AK_BME280 || prK == AK_BMP280) && !bmeStart(prA, prK == AK_BME280)) prK = 0;
+    else if (prK == AK_LPS22) wr8(prA, 0x10, 0x12);          // 1 a second, block update
+    else if (prK == AK_LPS22DF) { wr8(prA, 0x10, 0x08); wr8(prA, 0x11, 0x08); }
+  }
+  if (const AddOn* t = addFirst("th", { AK_SHT4, AK_SHT3, AK_AHT20, AK_BME280 })) {
+    thK = t->k; thA = t->a;
+    if (thK == AK_AHT20) { const uint8_t init[] = { 0xBE, 0x08, 0x00 }; wrCmd(thA, init, 3); delay(10); }
+    if (thK == AK_BME280 && bmeA != thA && !bmeStart(thA, true)) thK = 0;
+  }
+  if (const AddOn* l = addFirst("light", { AK_TSL2591, AK_BH1750 })) { lxK = l->k; lxA = l->a; lxStart(); }
+  if (const AddOn* m = addFirst("imu", { AK_BNO085, AK_LSM6 })) { imK = m->k; imA = m->a; imStart(); }
+  Serial.printf("I2C: %s\n", scanList.c_str());
+  for (const AddOn& x : addons) Serial.printf("  %s at 0x%02X%s\n", AK_NAME[x.k], x.a, x.on ? "" : " (off)");
+}
+String hwJson() {                                           // for Settings: what's fitted, what each pin does, the choices
+  String s = "{\"pins\":" + hwPinsJson() + ",\"feather\":[";
+  for (size_t i = 0; i < sizeof FPINS; i++) { const char* n = fpinName(FPINS[i]); s += String(i ? "," : "") + "[" + String(FPINS[i]) + "," + jStr(n ? n : String(FPINS[i])) + "]"; }
+  s += "],\"acts\":["; for (size_t i = 0; i < sizeof XB_ACT / sizeof XB_ACT[0]; i++) s += String(i ? "," : "") + jStr(XB_ACT[i]);
+  s += "],\"pcf\":" + String(pcfAddr) + ",\"pcfOK\":" + jBool(pcfOK) + ",\"aw\":" + String(awAddr) + ",\"awOK\":" + jBool(awOK) + ",\"bh\":" + String(bhAddr) +
+       ",\"imuM\":" + String(imuMount) + ",\"imuF\":" + jBool(imuFlip) + ",\"imuW\":" + jBool(imuWake) + ",\"imuR\":" + jBool(imuRot) +
+       ",\"scan\":" + jStr(scanList) + ",\"parts\":[";
+  for (size_t i = 0; i < addons.size(); i++) {
+    const AddOn& x = addons[i];
+    bool used = (x.k == prK && x.a == prA) || (x.k == thK && x.a == thA) || (x.k == lxK && x.a == lxA) || (x.k == imK && x.a == imA) || (x.k == AK_AW9523 && awOK) || (x.k == AK_PCF8574 && pcfOK);
+    s += String(i ? "," : "") + "{\"k\":" + jStr(AK_KEY[x.k]) + ",\"n\":" + jStr(AK_NAME[x.k]) + ",\"w\":" + jStr(AK_WHAT[x.k]) + ",\"a\":" + String(x.a) + ",\"on\":" + jBool(x.on) + ",\"used\":" + jBool(used) + "}";
+  }
+  s += "],\"down\":[" + jBool(pinDown(hp.back)) + "," + jBool(pinDown(hp.sel));
+  for (int i = 0; i < 4; i++) s += "," + jBool(hp.xbP[i].length() && pinDown(hp.xbP[i]));
+  return s + "]}";
 }
 
 // ======================================================================
@@ -1225,12 +1633,22 @@ uint32_t brLast() {                                        // the newest slot wi
   return 0;
 }
 fs::FS* baroFS() { return sdOK ? (fs::FS*)&SD : (flashOK ? (fs::FS*)&LittleFS : nullptr); }
+bool pressRead(float& h, float& c) {                       // the pressure sensor Add-ons picked (hPa, its temperature)
+  switch (prK) {
+    case AK_BMP3: if (!bmp.performReading()) return false; h = bmp.pressure / 100.0f; c = bmp.temperature; return true;
+    case AK_DPS310: return dpsRead(prA, h, c);
+    case AK_LPS22: case AK_LPS22DF: return lpsRead(prA, h, c);
+    case AK_BME280: case AK_BMP280: return bmeRead(h, c, nullptr);
+  }
+  return false;
+}
 void baroStart() {
-  bmpOK = bmp.begin_I2C(0x77) || bmp.begin_I2C(0x76);
+  bmpOK = prK != 0;
+  if (prK == AK_BMP3) {
+    bmpOK = bmp.begin_I2C(prA);
+    if (bmpOK) { bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X); bmp.setPressureOversampling(BMP3_OVERSAMPLING_8X); bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3); }
+  }
   if (!bmpOK) return;
-  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_2X);
-  bmp.setPressureOversampling(BMP3_OVERSAMPLING_8X);
-  bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
   brRing = (BrPt*)malloc(sizeof(BrPt) * BR_N);
   if (brRing) for (uint16_t i = 0; i < BR_N; i++) brRing[i] = { 0, 0xFFFF };
 }
@@ -1271,10 +1689,9 @@ void baroTick() {
   if (timeValid && !baroLoaded) baroLoad();
   if (lastBaroMs && millis() - lastBaroMs < BARO_READ_S * 1000UL) return;
   lastBaroMs = millis();
-  if (!bmp.performReading()) return;
-  float h = bmp.pressure / 100.0f;
+  float h, c; if (!pressRead(h, c)) return;
   if (!(h > 300 && h < 1200)) return;                      // not a real reading
-  baroHpa = h; baroC = bmp.temperature;
+  baroHpa = h; baroC = c;
   if (!timeValid) return;
   uint32_t slot = (uint32_t)time(nullptr) / BARO_SAVE_S;
   if (slot != baroSlot) {
@@ -1530,7 +1947,7 @@ void gpsSentence(char* line) {
     gps.fixEpoch = ep;
     // clock: GPS wins over the RTC and the browser; NTP (house Wi-Fi) wins over GPS
     bool ntpFresh = !strcmp(timeSrc, "ntp") && lastNtpSync && millis() - lastNtpSync < 6UL * 3600000UL;
-    if (ep > 1735689600UL && !ntpFresh) {
+    if (ep > 1735689600UL && !ntpFresh && !cfg.clkMan) {        // Manual: only you set the clock
       long diff = (long)ep - (long)time(nullptr);
       if (!timeValid || ((diff > 1 || diff < -1) && (!gps.lastClockSet || millis() - gps.lastClockSet > 600000UL)) || strcmp(timeSrc, "gps")) {
         setSystemUtc((time_t)ep); writeRtc((time_t)ep);
@@ -1544,7 +1961,7 @@ void gpsSentence(char* line) {
     uint32_t now = (uint32_t)time(nullptr);
     fixKeep(now);
     double m = gps.ptEpoch ? distM(gps.ptLat, gps.ptLon, gps.lat, gps.lon) : 1e9;
-    if (gps.newSeg || !gps.ptEpoch || (now - gps.ptEpoch >= GPS_LOG_S && m >= GPS_MOVE_M) || now - gps.ptEpoch >= GPS_STILL_S) gpsLogPoint(now);
+    if (gps.newSeg || !gps.ptEpoch || (now - gps.ptEpoch >= GPS_LOG_S[cfg.gpsDet] && m >= GPS_MOVE_M[cfg.gpsDet]) || now - gps.ptEpoch >= GPS_STILL_S[cfg.gpsDet]) gpsLogPoint(now);
   }
 }
 
@@ -1577,12 +1994,20 @@ void onWiFiEvent(WiFiEvent_t ev) {
   if (ev == ARDUINO_EVENT_WIFI_STA_DISCONNECTED && staUp) staLost = true;
 }
 
+bool apForce = false;                    // the quick menu's Hotspot on: up until the box restarts, whatever Settings says
+bool apWanted() { return !staUp || !cfg.apHomeOff || apForce; }
+void apApply() {                         // the hotspot on or off as it should be now (on the house Wi-Fi's channel when joined)
+  if (apWanted()) apUp = WiFi.softAP(cfg.apSsid.c_str(), cfg.apPass.c_str(), staUp ? WiFi.channel() : AP_CHANNEL);
+  else if (apUp) { WiFi.softAPdisconnect(false); apUp = false; }
+}
+void ntpApply() {                        // internet time only while the clock source is Automatic
+  if (staUp && !cfg.clkMan) { sntp_set_time_sync_notification_cb(timeSyncCb); configTzTime(cfg.tz.c_str(), "pool.ntp.org", "time.nist.gov"); }
+  else { if (esp_sntp_enabled()) esp_sntp_stop(); setenv("TZ", cfg.tz.c_str(), 1); tzset(); }
+}
 void onStaConnected() {
   staUp = true;
-  if (AP_ALWAYS) apUp = WiFi.softAP(cfg.apSsid.c_str(), cfg.apPass.c_str(), WiFi.channel());
-  else { WiFi.softAPdisconnect(true); apUp = false; }
-  sntp_set_time_sync_notification_cb(timeSyncCb);
-  configTzTime(cfg.tz.c_str(), "pool.ntp.org", "time.nist.gov");
+  apApply();
+  ntpApply();
 }
 
 bool tryHomeWiFi(uint32_t ms) {
@@ -1614,9 +2039,10 @@ void startWiFi() {
     if (home && tryHomeWiFi(15000)) onStaConnected();
   }
   lastScan = millis();
-  MDNS.begin(MDNS_NAME);
-  MDNS.addService("http", "tcp", 80);
+  mdnsStart();
 }
+
+void mdnsStart() { MDNS.end(); if (MDNS.begin(cfg.mdns.c_str())) MDNS.addService("http", "tcp", 80); }
 
 void startEspNow() {
   if (esp_now_init() != ESP_OK) { Serial.println("ESP-NOW init failed"); return; }
@@ -1630,12 +2056,14 @@ void wifiTick() {
     staLost = false; staUp = false;
     WiFi.disconnect(false);
     Serial.println("Left house Wi-Fi - hotspot only");
+    if (!apUp) apApply();                // the hotspot was off at home: back on, or the box can't be reached
     lastScan = millis(); scanEvery = 45000;
   }
   if (cfgApplyAt && millis() > cfgApplyAt) {          // settings changed from the dashboard (after its reply went out)
     cfgApplyAt = 0;
     setenv("TZ", cfg.tz.c_str(), 1); tzset();
-    if (cfgApplyAp) { cfgApplyAp = false; apUp = WiFi.softAP(cfg.apSsid.c_str(), cfg.apPass.c_str(), WiFi.channel()); }
+    if (cfgApplyAp) { cfgApplyAp = false; apApply(); }
+    if (cfgApplyMdns) { cfgApplyMdns = false; mdnsStart(); }
     if (cfgApplySta) { cfgApplySta = false; if (staUp) { staUp = false; WiFi.disconnect(false); } lastScan = 0; scanEvery = 45000; }
   }
   if (staUp || !cfg.homeSsid.length()) return;
@@ -1648,7 +2076,7 @@ void wifiTick() {
     lastScan = millis();
     if (home) {
       if (tryHomeWiFi(15000)) { onStaConnected(); scanEvery = 45000; Serial.println("Joined house Wi-Fi"); }
-      else { apUp = WiFi.softAP(cfg.apSsid.c_str(), cfg.apPass.c_str(), WiFi.channel()); scanEvery = min<uint32_t>(scanEvery * 2, 1800000UL); }   // wrong password? back off
+      else { apApply(); scanEvery = min<uint32_t>(scanEvery * 2, 1800000UL); }   // wrong password? back off
     }
     return;
   }
@@ -1694,12 +2122,8 @@ LbOled oled;
 const uint8_t OLED_ADDR = 0x3D;
 const uint8_t OLED_ROT  = 0;                      // 0-3: turns the picture to suit how the screen is mounted
 const uint16_t C_ON = 15, C_DIM = 5, C_OFF = 0;    // grey levels (0-15)
-const uint8_t BTN_EXT  = 11;                      // BACK button (558), lower left on the lid: common to GND, NO to pin 11
-const uint8_t BTN_LED  = 18;                      // A0: BACK's LED ring +, LED - to GND (dimmed with PWM)
-const uint8_t BTN_LED_CH = 4;                     // LEDC channel for the light (0 and 1 are the buzzer's)
-const uint8_t BTN2_EXT = 9;                       // SELECT button (558), up and right of BACK: common to GND, NO to pin 9
-const uint8_t BTN2_LED = 17;                      // A1: its LED ring +, LED - to GND
-const uint8_t BTN2_LED_CH = 5;
+// BACK (558, lower left) on pin 11, SELECT (558, upper right) on pin 9, their LED rings on A0 and A1: the
+// defaults; Settings > Pin mapping can move them (hp, above)
 const uint16_t BOTH_MS = 3000;                    // hold both buttons this long: the "both" shortcut
 const uint8_t LED_DIM  = 10;                      // light while the screen sleeps (0-255)
 const uint8_t ENC_ADDRS[] = { 0x37, 0x38, 0x39 }; // encoder 5880: A0 closed = 0x37, A1 = 0x38, both = 0x39
@@ -1708,7 +2132,7 @@ const int8_t  ENC_INT_PIN = -1;                   // its INT pad, if wired (e.g.
 const uint8_t ENC_SW = 24;                        // the encoder's push switch, on the seesaw chip
 const bool    ENC_REVERSE = false;                // scrolls the wrong way? set true
 const uint16_t SEL_OFF_MS = 1500;                 // hold SELECT this long: screen off
-const uint8_t BUZ_A = 5, BUZ_B = 6;               // piezo (1739) wired between pins 5 and 6, driven in opposite phase
+int8_t BUZ_A = 5, BUZ_B = 6;                      // piezo (1739) between pins 5 and 6, driven in opposite phase (Pin mapping; B -1: A to GND)
 const uint16_t BUZ_HZ = 2650;                     // the piezo's loudest note
 const uint16_t HOLD_MS = 600;
 const int ROWS = 13;                              // text rows under the title bar
@@ -1743,13 +2167,14 @@ String clSelId;   // the checklist item last highlighted
 bool redraw = true;
 
 struct Btn { uint8_t pin; bool down, held, raw, swallow, paired, woke; uint32_t t0, chg; };   // paired: the other button was down too; woke: its press only woke the screen
-Btn btn = { BTN_EXT }, btn2 = { BTN2_EXT };
+Btn btn = { 0 }, btn2 = { 0 }, xbtn[4] = {};                // xbtn: the extra buttons (Pin mapping)
 // shortcuts, as the dashboard sets them: btnP for an ACTION (knob) press, btnB for BACK + SELECT held 3 s
 String btnP = "job", btnB = "phone";
 // ACTION's quick menu: hold the knob in and it opens (on Close) and stays open; turn to a row, press the knob
 // (or SELECT) to run it, BACK to close. Which rows, in what order: Settings > The box's screen.
 std::vector<String> qmKeys = { "screen", "gps", "job", "trip", "mark", "bnwas", "phone", "clock" };
 bool qmOn = false; int qmSel = 0, qmTop = 0;
+bool csOn = false; int csF = 0; int csV[5];              // SET CLOCK: the field being changed, and year month day hour minute
 bool bothDone = false;                                   // both held long enough: their releases do nothing else
 uint32_t findPhoneEp = 0;                                // when the box last asked the phones to sound (the dashboard polls it)
 
@@ -1965,7 +2390,7 @@ void jobPress(int s) {
 //  flash (/hwo/trip.json), so switching the box off doesn't lose it.
 // ======================================================================
 const float TRIP_KN = 3.0f;                               // moving: faster than this (about 3.5 mph)
-const uint32_t TRIP_ASK_MS = 3600000UL, TRIP_BEEP_MS = 120000UL;
+const uint32_t TRIP_BEEP_MS = 120000UL;   // the "still on it?" question comes after Settings' tripAskMin stopped
 struct WorkTrip { bool on = false, have1 = false; uint32_t t1 = 0, lastMoveEp = 0; double m = 0, lat1 = 0, lon1 = 0, pla = 0, plo = 0; };
 WorkTrip WT;
 uint32_t tripStillMs = 0, tripAskSince = 0, lastTripWatch = 0, lastTripSave = 0;
@@ -2046,7 +2471,7 @@ void tripWatch() {                                        // once a second while
     }
     if (!isnan(gps.kn) && gps.kn >= TRIP_KN) { tripStillMs = millis(); if (timeValid) WT.lastMoveEp = time(nullptr); }
   }
-  if (!tripAsk && millis() - tripStillMs > TRIP_ASK_MS) { tripAsk = true; tripAskSel = 0; tripAskSince = millis(); redraw = true; }
+  if (!tripAsk && millis() - tripStillMs > (uint32_t)cfg.tripAskMin * 60000UL) { tripAsk = true; tripAskSel = 0; tripAskSince = millis(); redraw = true; }
   if (millis() - lastTripSave > 60000) tripSave();
 }
 bool tripBeeping() { return tripAsk && millis() - tripAskSince < TRIP_BEEP_MS; }
@@ -2067,31 +2492,51 @@ void devSeen(String n) {
 
 fs::FS* clFS() { return (flashOK && LittleFS.exists(CL_PATH)) ? (fs::FS*)&LittleFS : (sdOK && SD.exists(CL_PATH)) ? (fs::FS*)&SD : nullptr; }
 
+// JSON for the checklist parses into PSRAM (2 MB on the Feather S2), so a long list doesn't eat the
+// internal RAM the Wi-Fi needs. Without PSRAM it falls back to the normal heap.
+struct PsAlloc : ArduinoJson::Allocator {
+  void* allocate(size_t n) override { void* p = psramFound() ? heap_caps_malloc(n, MALLOC_CAP_SPIRAM) : nullptr; return p ? p : malloc(n); }
+  void deallocate(void* p) override { free(p); }
+  void* reallocate(void* p, size_t n) override { void* q = psramFound() ? heap_caps_realloc(p, n, MALLOC_CAP_SPIRAM) : nullptr; return q ? q : realloc(p, n); }
+} psAlloc;
 bool clReadDoc(JsonDocument& doc) {
   fs::FS* fs = clFS(); if (!fs) return false;
   File f = fs->open(CL_PATH, FILE_READ); if (!f) return false;
   DeserializationError e = deserializeJson(doc, f); f.close();
   return !e && doc["items"].is<JsonArray>();
 }
-void clWalk(JsonArray items, const String& pid, uint8_t depth) {
-  for (JsonObject it : items) {
-    String par = it["parent"] | "";
-    bool parOk = false;
-    if (par.length()) for (JsonObject x : items) if (par == (const char*)(x["id"] | "")) { parOk = true; break; }
-    if ((parOk ? par : String("")) != pid) continue;
+// The rows in tree order. Each item's parent is found once (ids sorted, then a binary search), so a list
+// of hundreds builds in a few milliseconds instead of scanning the whole list for every row.
+void clWalkK(const std::vector<JsonObject>& v, const std::vector<std::vector<int>>& kids, int at, uint8_t depth) {
+  for (int i : kids[at]) {
+    JsonObject it = v[i];
     if (cfg.clHideDone && (bool)(it["done"] | false)) continue;   // hidden, with everything under it
     clRows.push_back({ String((const char*)(it["id"] | "")), ascii(it["text"] | ""), depth, (bool)(it["done"] | false) });
-    if (depth < 6) clWalk(items, it["id"] | "", depth + 1);
+    if (depth < 6) clWalkK(v, kids, i, depth + 1);
   }
+}
+void clWalk(JsonArray items) {
+  std::vector<JsonObject> v; for (JsonObject x : items) v.push_back(x);
+  int n = v.size();
+  std::vector<int> byId(n); for (int i = 0; i < n; i++) byId[i] = i;
+  auto idOf = [&](int i) -> const char* { return v[i]["id"] | ""; };
+  std::sort(byId.begin(), byId.end(), [&](int a, int b) { return strcmp(idOf(a), idOf(b)) < 0; });
+  std::vector<std::vector<int>> kids(n + 1);   // kids[n]: the top level
+  for (int i = 0; i < n; i++) {
+    const char* p = v[i]["parent"] | ""; int pi = n;
+    if (*p) { int lo = 0, hi = n - 1; while (lo <= hi) { int m = (lo + hi) / 2, c = strcmp(idOf(byId[m]), p); if (!c) { pi = byId[m]; break; } if (c < 0) lo = m + 1; else hi = m - 1; } }
+    kids[pi == i ? n : pi].push_back(i);
+  }
+  clWalkK(v, kids, n, 0);
 }
 void clLoad() {
   if (clVer == docVer) return;
   clVer = docVer; clRows.clear(); clDay = ""; clTitle = ""; clTotal = 0; clDoneN = 0;
-  JsonDocument doc;
+  JsonDocument doc(&psAlloc);
   if (!clReadDoc(doc)) return;
   clDay = doc["day"] | ""; clTitle = ascii(doc["title"] | "");
   for (JsonObject x : doc["items"].as<JsonArray>()) { clTotal++; if ((bool)(x["done"] | false)) clDoneN++; }
-  clWalk(doc["items"].as<JsonArray>(), "", 0);
+  clWalk(doc["items"].as<JsonArray>());
   int k = -1;   // find the remembered item again (the list may have changed on the phone)
   for (size_t i = 0; clSelId.length() && i < clRows.size(); i++) if (clRows[i].id == clSelId) { k = i; break; }
   int n = clRows.size();
@@ -2102,7 +2547,7 @@ void clLoad() {
 // also unticks the items it sits under. The file changes, and linked work orders get their steps / a note.
 void clToggle(int row) {
   if (row < 0 || row >= (int)clRows.size()) return;
-  JsonDocument doc;
+  JsonDocument doc(&psAlloc);
   if (!clReadDoc(doc)) { msg = "Checklist not found"; msgUntil = millis() + 2000; return; }
   JsonArray items = doc["items"].as<JsonArray>();
   auto findItem = [&](const String& id) -> JsonObject { for (JsonObject x : items) if (id == (const char*)(x["id"] | "")) return x; return JsonObject(); };
@@ -2113,7 +2558,7 @@ void clToggle(int row) {
   String today = timeValid ? localDate(time(nullptr)) : String(""), day = doc["day"] | today;
   String stamp = timeValid ? isoUtc(time(nullptr)) : String("");
   std::vector<String> ids = { id0 };
-  for (size_t k = 0; k < ids.size() && ids.size() < 300; k++)
+  for (size_t k = 0; k < ids.size() && ids.size() < 1000; k++)
     for (JsonObject x : items) if (ids[k] == (const char*)(x["parent"] | "")) ids.push_back(x["id"] | "");
   if (!done) {
     String par = it["parent"] | "";
@@ -2290,15 +2735,17 @@ bool alertVibe() { return hapOK && cfg.alert != 0; }
 const char* ALERT_NAME[] = { "Sound", "Vibrate", "Both" };
 void buzSet(uint32_t hz) {
   if (!buzOK) return;
-  if (!hz) { if (buzOn) { ledcWrite(BUZ_A, 0); ledcWrite(BUZ_B, 256); buzOn = false; } return; }   // 256 inverted = both pins low
+  if (!hz) { if (buzOn) { ledcWrite(BUZ_A, 0); if (BUZ_B >= 0) ledcWrite(BUZ_B, 256); buzOn = false; } return; }   // 256 inverted = both pins low
   if (hz != buzHz) { ledcChangeFrequency(BUZ_A, hz, 8); buzHz = hz; }
-  if (!buzOn) { ledcWrite(BUZ_A, 128); ledcWrite(BUZ_B, 128); buzOn = true; }
+  if (!buzOn) { ledcWrite(BUZ_A, 128); if (BUZ_B >= 0) ledcWrite(BUZ_B, 128); buzOn = true; }
 }
 void buzStart() {
   // channels 0 and 1 share one timer, so the two pins stay in step; B is inverted: twice the swing across the piezo
-  buzOK = ledcAttachChannel(BUZ_A, BUZ_HZ, 8, 0) && ledcAttachChannel(BUZ_B, BUZ_HZ, 8, 1) && ledcOutputInvert(BUZ_B, true);
+  BUZ_A = pinKind(hp.buzA) == 'f' ? pinNum(hp.buzA) : -1; BUZ_B = pinKind(hp.buzB) == 'f' ? pinNum(hp.buzB) : -1;
+  if (BUZ_A < 0) { buzOK = false; return; }                // no buzzer (Pin mapping)
+  buzOK = ledcAttachChannel(BUZ_A, BUZ_HZ, 8, 0) && (BUZ_B < 0 || (ledcAttachChannel(BUZ_B, BUZ_HZ, 8, 1) && ledcOutputInvert(BUZ_B, true)));
   buzHz = BUZ_HZ;
-  if (buzOK) { ledcWrite(BUZ_A, 0); ledcWrite(BUZ_B, 256); }
+  if (buzOK) { ledcWrite(BUZ_A, 0); if (BUZ_B >= 0) ledcWrite(BUZ_B, 256); }
 }
 
 struct KTimer {
@@ -2378,6 +2825,47 @@ void pushFrame() {                       // sends only the rows that changed (a 
   oled.win(y1, y2); oled.display();
   if (prevFrame) { memcpy(prevFrame, b, 128 * 64); frameStale = false; }
 }
+// ---- the update screen (like the VMR's): over every screen, on and at full brightness while a .lbk or .bin comes in ----
+uint8_t otaSt = 0;                                       // 0 none, 1 receiving, 2 done (restarting), 3 failed (shown 15 s)
+uint32_t otaDone = 0, otaTot = 0, otaEndMs = 0, otaDrawMs = 0; String otaNew;
+void ctr(int y, const String& t, uint16_t col = C_ON) { String f = fit(t, 21); oled.setTextColor(col); oled.setCursor((128 - 6 * (int)f.length()) / 2, y); oled.print(f); oled.setTextColor(C_ON); }
+void otaDraw(bool now) {
+  if (!oledOK || (!now && millis() - otaDrawMs < 300)) return;   // a whole frame is slow over I2C: a few a second is plenty
+  otaDrawMs = millis();
+  if (!screenOn) screenPower(true);
+  oled.setContrast(255);
+  oled.clearDisplay(); oled.setTextSize(1);
+  int pct = otaSt == 2 ? 100 : otaTot ? (int)min<uint64_t>(100, 100ULL * otaDone / otaTot) : 0;
+  oled.fillRect(0, 0, 128, 9, C_ON); oled.setTextColor(C_OFF);
+  oled.setCursor(1, 1); oled.print(otaSt == 3 ? "UPDATE FAILED" : "FIRMWARE UPDATE");
+  if (otaSt != 3) { String p = String(pct) + "%"; oled.setCursor(127 - 6 * p.length(), 1); oled.print(p); }
+  oled.setTextColor(C_ON);
+  if (otaSt != 3) {
+    ctr(18, "Life Logger");
+    ctr(30, "v" FW_VERSION " --> " + (otaNew.length() ? "v" + otaNew : String(otaSt == 2 ? "new" : "...")));
+    ctr(46, otaSt == 2 ? String("Restarting...") : upKind == 3 ? String("Dashboard") : upKind == 1 || upKind == 4 ? String("Firmware") : String("Starting"));
+    ctr(58, String(otaDone / 1024) + " / " + String(otaTot / 1024) + " kB");
+    ctr(80, "Keep it switched on", C_DIM);
+    oled.drawRect(0, 108, 128, 14, C_ON);
+    oled.fillRect(2, 110, 124 * pct / 100, 10, C_ON);
+  } else {
+    String e = otaErr.length() ? otaErr : String("Upload incomplete");   // the reason, over up to three lines, broken at spaces
+    int y = 18;
+    while (e.length() && y <= 36) {
+      int cut = e.length() <= 21 ? e.length() : 21;
+      if (cut < (int)e.length()) { int sp = e.lastIndexOf(' ', 21); if (sp > 8) cut = sp; }
+      ctr(y, e.substring(0, cut)); e = e.substring(cut); e.trim(); y += 10;
+    }
+    ctr(62, "Old firmware kept");
+    ctr(74, "Nothing was lost", C_DIM);
+  }
+  frameStale = true; pushFrame();
+}
+void otaFailed() { otaSt = 3; otaEndMs = millis(); otaDraw(true); }
+void otaTick() {                                         // the failure stays up 15 s (or until a press), then the screens come back
+  if (otaSt == 3 && millis() - otaEndMs > 15000) { otaSt = 0; if (oledOK) oled.setContrast(cfg.contrast); frameStale = true; redraw = true; }
+}
+
 void head(const char* nm) {                             // the title, and the time (with seconds) and battery on the right
   String tm5, name = nm;
   if (timeValid) {
@@ -2499,7 +2987,16 @@ String lbLine(const String& k, uint16_t& col) {
     return o;
   }
   if (k == "sun") { String o; if (!sunLine(o)) col = C_DIM; return o; }
-  if (k == "chip") { float c = bmpOK && !isnan(baroC) ? baroC : temperatureRead(); return "Box " + (fTemp == "C" ? String(c, 1) + "C" : String(c * 9 / 5 + 32, 1) + "F"); }
+  if (k == "boxth") {                                     // Box 70.3F 45%
+    if (!boxThFresh()) { col = C_DIM; return thK ? String("Box --") : String("No temp sensor"); }
+    return "Box " + (fTemp == "C" ? String(boxC, 1) + "C " : String(boxC * 9 / 5 + 32, 1) + "F ") + String((int)lroundf(boxRH)) + "%";
+  }
+  if (k == "lux") {
+    if (!lxK) { col = C_DIM; return String("No light sensor"); }
+    if (isnan(boxLux)) { col = C_DIM; return String("Light --"); }
+    return "Light " + String(boxLux < 10 ? String(boxLux, 1) : String((long)lroundf(boxLux))) + " lx";
+  }
+  if (k == "chip") { float c = boxThFresh() ? boxC : bmpOK && !isnan(baroC) ? baroC : temperatureRead(); return "Box " + (fTemp == "C" ? String(c, 1) + "C" : String(c * 9 / 5 + 32, 1) + "F"); }
   if (k == "up") { uint32_t u = millis() / 1000; snprintf(b, sizeof b, "Up %lud %02lu:%02lu", (unsigned long)(u / 86400), (unsigned long)(u / 3600 % 24), (unsigned long)(u / 60 % 60)); return b; }
   if (k.startsWith("n:")) { int p = k.indexOf('|'); String o; if (!tempLine(k.substring(2, p < 0 ? k.length() : p).c_str(), p < 0 ? "" : k.substring(p + 1).c_str(), o)) col = C_DIM; return o; }
   return "";
@@ -2765,7 +3262,9 @@ void drawScreen() {
   mqOn = false; yOff = 0;
   oled.clearDisplay();
   oled.setTextSize(1);
-  if (qmOn) qmDraw();
+  if (otaSt) { otaDraw(true); return; }
+  if (csOn) csDraw();
+  else if (qmOn) qmDraw();
   else if (scr == S_STATUS) {
     head("LIFE LOGGER");
     todayLoad();
@@ -2916,8 +3415,9 @@ void drawScreen() {
     head("JOIN");
     row(0, "WiFi " + ascii(cfg.apSsid));
     row(1, "Pass " + ascii(cfg.apPass));
-    row(3, "Open " + String(MDNS_NAME) + ".local");
-    row(4, "  or " + WiFi.softAPIP().toString());
+    if (!apUp) { row(0, "Hotspot off at home", false, C_DIM); row(1, "QUICK MENU: Hotspot", false, C_DIM); }
+    row(3, "Open " + fit(cfg.mdns, 15) + ".local");
+    row(4, "  or " + (apUp ? WiFi.softAPIP() : WiFi.localIP()).toString());
     row(6, staUp ? "Home: " + WiFi.localIP().toString() : String("Home WiFi: not here"));
     std::vector<Dev> dv; for (auto& d : devs) if (millis() - d.ms < 600000UL) dv.push_back(d);   // dashboards open in the last 10 minutes, newest first
     for (size_t i = 1; i < dv.size(); i++) for (size_t k = i; k > 0 && dv[k].ms > dv[k - 1].ms; k--) std::swap(dv[k], dv[k - 1]);
@@ -2989,14 +3489,15 @@ void screenPower(bool on) {
   on = on && oledOK;
   if (on == screenOn) return;
   screenOn = on;
-  if (!on) qmOn = false;
+  if (!on) { qmOn = false; csOn = false; }
   if (oledOK) oled.oled_command(on ? SSD1327_DISPLAYON : SSD1327_DISPLAYOFF);
   if (on) { oled.setContrast(cfg.contrast); frameStale = true; redraw = true; }
 }
 // any turn or press: restarts the sleep timer and the BNWAS period; true if it should do nothing else
 // (it stopped an alarm, or only woke the screen)
 bool touched(uint32_t now) {
-  lastInputMs = now; input();
+  lastInputMs = now; input(); imuWoke = false;
+  if (otaSt == 3) { otaEndMs = 0; otaTick(); return true; }
   if (cfg.bnwasOn) bnwasRestart(now);
   if (alarmActive()) { silence(true, now); msg = "Stopped"; msgUntil = now + 1000; return true; }
   if (tripBeeping()) { tripAskSince = millis() - TRIP_BEEP_MS; if (!screenOn) screenPower(true); redraw = true; return true; }   // the first touch only stops the beeping
@@ -3050,6 +3551,9 @@ String jobQuickLabel() {
 }
 std::vector<QmRow> qmRows() {
   std::vector<QmRow> r; r.push_back({ "Close", "" });
+  bool hasCs = false; for (const String& k : qmKeys) if (k == "setclk") hasCs = true;
+  if (!timeValid && !hasCs) r.push_back({ "Set clock", "setclk" });   // no clock: always offered
+  if (!apUp) r.push_back({ "Hotspot on", "apon" });                    // off at home: a way back without the dashboard
   for (const String& k : qmKeys) {
     if (k == "screen") r.push_back({ "Screen off", "off" });
     else if (k == "gps") {
@@ -3062,12 +3566,54 @@ std::vector<QmRow> qmRows() {
     else if (k == "bnwas") r.push_back({ cfg.bnwasOn ? "BNWAS off" : "BNWAS on", "bnwas" });
     else if (k == "phone") r.push_back({ "Find my phone", "phone" });
     else if (k == "clock") r.push_back({ "Clock", "clock" });
+    else if (k == "setclk") r.push_back({ "Set clock", "setclk" });
     else if (k == "home") r.push_back({ "Home", "home" });
     else if (k == "beep") r.push_back({ "Test alert", "beep" });
     else if (k == "alert" && hapOK) r.push_back({ String("Alerts: ") + ALERT_NAME[cfg.alert] + " > " + ALERT_NAME[(cfg.alert + 1) % 3], "alert" });
     else if (k == "restart") r.push_back({ "Restart", "restart" });
   }
   return r;
+}
+int daysIn(int y, int m) { static const uint8_t D[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }; return m == 2 && ((y % 4 == 0 && y % 100) || y % 400 == 0) ? 29 : D[m - 1]; }
+void csOpen() {                                          // starts from the box's time, or 1 January if it has none
+  time_t t = time(nullptr); struct tm tm; localtime_r(&t, &tm);
+  if (timeValid) { csV[0] = tm.tm_year + 1900; csV[1] = tm.tm_mon + 1; csV[2] = tm.tm_mday; csV[3] = tm.tm_hour; csV[4] = tm.tm_min; }
+  else { csV[0] = 2026; csV[1] = 1; csV[2] = 1; csV[3] = 12; csV[4] = 0; }
+  if (csV[0] < 2025) csV[0] = 2026;
+  csOn = true; csF = 0; qmOn = false; redraw = true;
+}
+void csTurn(int d) {
+  static const int LO[] = { 2025, 1, 1, 0, 0 }, HI[] = { 2099, 12, 31, 23, 59 };
+  int hi = csF == 2 ? daysIn(csV[0], csV[1]) : HI[csF], span = hi - LO[csF] + 1;
+  csV[csF] = LO[csF] + (((csV[csF] - LO[csF] + d) % span) + span) % span;   // wraps round
+  csV[2] = min(csV[2], daysIn(csV[0], csV[1]));
+  redraw = true;
+}
+void csNext() {
+  if (csF < 4) { csF++; redraw = true; return; }
+  csOn = false; redraw = true;
+  time_t e = localToEpoch(csV[0], csV[1], csV[2], csV[3], csV[4], 0);
+  if (!setClockTo(e, "manual")) { msg = "Not set"; msgUntil = millis() + 1500; return; }
+  bool corr = !cfg.clkMan && ((gpsI2C && !gpsAsleep) || staUp);
+  msg = corr ? "Set (GPS/net may fix)" : "Clock set"; msgUntil = millis() + 2500;
+}
+void csBack() { if (csF > 0) csF--; else { csOn = false; msg = "Clock not changed"; msgUntil = millis() + 1200; } redraw = true; }
+void csDraw() {
+  head("SET CLOCK");
+  static const char* N[] = { "Year", "Month", "Day", "Hour", "Minute" };
+  for (int i = 0; i < 5; i++) {
+    String v = String(csV[i]);
+    if (i == 3 && boxH12) v = String(csV[3] % 12 ? csV[3] % 12 : 12) + (csV[3] < 12 ? " am" : " pm");
+    else if (i) { if (v.length() < 2) v = "0" + v; }
+    rowLR(i, (i == csF ? "> " : "  ") + String(N[i]), v, C_ON, i == csF);
+  }
+  String z = cfg.tz; int k = 0; while (k < (int)z.length() && isalpha((unsigned char)z[k])) k++;
+  row(6, "Zone " + (k >= 3 ? z.substring(0, k) : z), false, C_DIM);
+  row(7, cfg.clkMan ? "Source: manual" : "Source: auto", false, C_DIM);
+  if (!cfg.clkMan) row(8, "GPS/net may correct", false, C_DIM);
+  row(10, "Turn: change", false, C_DIM);
+  row(11, csF < 4 ? "Press: next field" : "Press: set the clock", false, C_DIM);
+  row(12, csF ? "BACK: previous" : "BACK: cancel", false, C_DIM);
 }
 void qmDraw() {
   std::vector<QmRow> R = qmRows();
@@ -3081,13 +3627,20 @@ void qmRun() {
   std::vector<QmRow> R = qmRows();
   qmOn = false; redraw = true;
   if (qmSel <= 0 || qmSel >= (int)R.size()) return;        // Close
-  const String a = R[qmSel].a;
+  runAction(R[qmSel].a);
+}
+void runAction(const String& a) {                          // a quick-menu row, or an extra button's action
+  if (a == "gps") { gpsMode = (gpsMode + 1) % 3; lastGpsPower = 0; msg = gpsMode == 1 ? "GPS on" : gpsMode == 2 ? "GPS off" : "GPS auto"; msgUntil = millis() + 1500; redraw = true; return; }
   if (a.startsWith("gps")) {
     gpsMode = a[3] - '0'; lastGpsPower = 0;
     msg = gpsMode == 1 ? "GPS on" : gpsMode == 2 ? "GPS off" : (staUp ? "GPS auto: asleep" : "GPS auto: on"); msgUntil = millis() + 1500;
   } else if (a == "alert") {
     cfg.alert = (cfg.alert + 1) % 3; if (flashOK) cfgSave();
     msg = String("Alerts: ") + ALERT_NAME[cfg.alert]; msgUntil = millis() + 1500;
+  } else if (a == "setclk") { csOpen();
+  } else if (a == "apon") {
+    apForce = true; apApply();
+    msg = apUp ? "Hotspot on" : "Hotspot failed"; msgUntil = millis() + 1500;
   } else if (a == "bnwas") {
     cfg.bnwasOn = !cfg.bnwasOn; bnwasRestart(millis()); if (flashOK) cfgSave();
     msg = cfg.bnwasOn ? "BNWAS on" : "BNWAS off"; msgUntil = millis() + 1500;
@@ -3150,10 +3703,10 @@ void encStart() {
 }
 
 void screenStart() {
-  pinMode(BTN_EXT, INPUT_PULLUP); pinMode(BTN2_EXT, INPUT_PULLUP);
+  pinInput(hp.back); pinInput(hp.sel);
+  for (int i = 0; i < 4; i++) if (hp.xbP[i].length()) pinInput(hp.xbP[i]);
   buzStart();                                              // claims LEDC channels 0 and 1 first
-  ledcAttachChannel(BTN_LED, 5000, 8, BTN_LED_CH); ledcWrite(BTN_LED, 0);
-  ledcAttachChannel(BTN2_LED, 5000, 8, BTN2_LED_CH); ledcWrite(BTN2_LED, 0);
+  pinLedStart(hp.backLed); pinLedStart(hp.selLed); pinLedStart(hp.ind[0]); pinLedStart(hp.ind[1]);
   bnwasRestart(millis());
   oledOK = oled.begin(OLED_ADDR, true);
   encStart();
@@ -3182,11 +3735,11 @@ void encTick(uint32_t now) {
       bool wasOff = !screenOn && oledOK && !alarmActive() && !tripBeeping();
       encSw.swallow = touched(now); encSw.woke = encSw.swallow && wasOff;   // only woke the screen: a hold still opens the menu
     } else {
-      if (!encSw.swallow && !encSw.longDone && !encSw.turned) { if (qmOn) qmRun(); else shortcut(btnP); }
+      if (!encSw.swallow && !encSw.longDone && !encSw.turned) { if (csOn) csNext(); else if (qmOn) qmRun(); else shortcut(btnP); }
       encSw.swallow = false;
     }
   }
-  if (encSw.down && (!encSw.swallow || encSw.woke) && !encSw.longDone && !encSw.turned && !qmOn && !btn.down && now - encSw.t0 >= HOLD_MS) {
+  if (encSw.down && (!encSw.swallow || encSw.woke) && !encSw.longDone && !encSw.turned && !qmOn && !csOn && !btn.down && now - encSw.t0 >= HOLD_MS) {
     encSw.longDone = true; qmOn = true; qmSel = 0; qmTop = 0; lastInputMs = now; redraw = true;
   }
   // turning
@@ -3194,6 +3747,7 @@ void encTick(uint32_t now) {
   if (!delta) return;
   if (ENC_REVERSE) delta = -delta;
   if (encSw.down) encSw.turned = true;
+  if (csOn) { csTurn((int)delta); lastInputMs = now; return; }
   if (qmOn) { qmSel = constrain(qmSel + (int)delta, 0, (int)qmRows().size() - 1); lastInputMs = now; redraw = true; return; }
   if (touched(now)) return;                                // that click woke the screen (or stopped an alarm)
   if (btn.down && !btn.swallow) {                          // holding BACK: the knob sets the screen's brightness
@@ -3203,13 +3757,46 @@ void encTick(uint32_t now) {
   } else moveSel((int)delta);
 }
 
+// the box's own row in the climate files: its temperature and humidity, and its battery in the node's battery columns
+void envBoxRow(File& f, const String& u, const String& l) {
+  if (!boxThFresh()) return;
+  f.print(u); f.print(','); f.print(l); f.print(",Box,");
+  f.print(csvNum(boxC, 2)); f.print(','); f.print(csvNum(boxRH, 1)); f.print(',');
+  f.print(csvNum(battType ? battV : NAN, 3)); f.print(','); f.print(csvNum(battType ? battPct : NAN, 1)); f.println(',');
+}
+// IMU (Add-ons): picked up wakes the screen, and if that's all that woke it, it sleeps again after 20 s set down.
+// The picture turns with the box (whichever side is down is its bottom), unless the screen is lying (nearly) flat.
+float imSlow[3] = { NAN, NAN, NAN }; uint32_t imStillMs = 0, imRotMs = 0; uint8_t imRotCur = 0, imRotWant = 0;
+void imuTick(uint32_t now) {
+  if (!imK) return;
+  thTick(); lxTick(); imRead();
+  if (isnan(imG[0]) || now - imSeen > 1000) return;
+  float d = 0;
+  for (int i = 0; i < 3; i++) { if (isnan(imSlow[i])) imSlow[i] = imG[i]; float e = imG[i] - imSlow[i]; d += e * e; imSlow[i] += 0.1f * (imG[i] - imSlow[i]); }
+  d = sqrtf(d);
+  if (d > 0.03f) imStillMs = now;
+  if (imuWake && d > 0.12f && !screenOn && oledOK && !alarmActive()) { screenPower(true); lastInputMs = now; imuWoke = true; redraw = true; }
+  if (imuWoke && screenOn && now - imStillMs > 20000 && now - lastInputMs > 20000 && !alarmActive()) { imuWoke = false; screenPower(false); }
+  if (!imuRot || !oledOK || otaSt) return;
+  float x = imG[0], y = imuFlip ? -imG[1] : imG[1];
+  if (sqrtf(x * x + y * y) < 0.7f) { imRotMs = now; return; }   // lying flat: keep it as it is
+  float g = atan2f(y, x) * 57.29578f - 90.0f * imuMount;   // gravity, counter-clockwise from the screen's top
+  float off = fmodf(g - 180.0f + 45.0f + 3600.0f, 360.0f), inq = fmodf(off, 90.0f);
+  uint8_t want = (uint8_t)(off / 90.0f) & 3;
+  if (inq < 15 || inq > 75) { imRotMs = now; return; }    // near a corner: wait until it's clearly one side
+  if (want != imRotWant) { imRotWant = want; imRotMs = now; return; }
+  if (want != imRotCur && now - imRotMs > 800) { imRotCur = want; oled.setRotation((OLED_ROT + want) & 3); frameStale = true; redraw = true; }
+}
 void screenTick() {
   uint32_t now = millis();
+  otaTick();
   if (timeValid && now - lastTripCheck > 5000) { lastTripCheck = now; tripLoad(); }   // today's distance from the file, once
   tripWatch();
   alarmsTick(now);
   // BACK
-  bool raw = digitalRead(btn.pin) == LOW;
+  expRead();                                               // the expanders' buttons, if any are on them
+  if (imK) imuTick(now); else { thTick(); lxTick(); }
+  bool raw = pinDown(hp.back);
   if (raw != btn.raw) { btn.raw = raw; btn.chg = now; }
   if (now - btn.chg > 25 && raw != btn.down) {
     btn.down = raw;
@@ -3217,26 +3804,32 @@ void screenTick() {
     else {
       if (btn.swallow) btn.swallow = false;
       else if (bright) { bright = false; cfgSave(); msg = "Saved"; msgUntil = now + 800; redraw = true; }
-      else if (!btn.held && !btn.paired && !bothDone) { inputSrc = 1; onShort(); inputSrc = 0; }
+      else if (!btn.held && !btn.paired && !bothDone) { if (csOn) csBack(); else { inputSrc = 1; onShort(); inputSrc = 0; } }
       if (!btn2.down) bothDone = false;
     }
   }
-  if (btn.down && !btn.held && !btn.swallow && !btn2.down && now - btn.t0 >= HOLD_MS) { btn.held = true; inputSrc = 1; onHold(); inputSrc = 0; }
+  if (btn.down && !btn.held && !btn.swallow && !btn2.down && now - btn.t0 >= HOLD_MS) { btn.held = true; if (csOn) { csOn = false; redraw = true; } else { inputSrc = 1; onHold(); inputSrc = 0; } }
   // SELECT: a press opens, ticks or starts what is highlighted (or runs the quick menu's row); a hold turns the screen off
-  bool raw2 = digitalRead(btn2.pin) == LOW;
+  bool raw2 = pinDown(hp.sel);
   if (raw2 != btn2.raw) { btn2.raw = raw2; btn2.chg = now; }
   if (now - btn2.chg > 25 && raw2 != btn2.down) {
     btn2.down = raw2;
     if (raw2) { btn2.t0 = now; btn2.held = false; btn2.paired = btn.down; if (btn.down) btn.paired = true; btn2.swallow = touched(now); }
     else {
       if (btn2.swallow) {}
-      else if (!btn2.held && !btn2.paired && !bothDone && screenOn) { inputSrc = 2; if (qmOn) qmRun(); else press(); inputSrc = 0; }
+      else if (!btn2.held && !btn2.paired && !bothDone && screenOn) { inputSrc = 2; if (csOn) csNext(); else if (qmOn) qmRun(); else press(); inputSrc = 0; }
       btn2.swallow = false;
       if (!btn.down) bothDone = false;
     }
   }
   if (btn2.down && !btn2.held && !btn2.swallow && !btn.down && now - btn2.t0 >= SEL_OFF_MS) { btn2.held = true; qmOn = false; screenPower(false); }
   if (qmOn && btn.down && !btn.paired) { qmOn = false; btn.paired = true; redraw = true; }   // BACK while the menu is open: close it, run nothing else
+  for (int i = 0; i < 4; i++) {                            // extra buttons: a press runs its action
+    if (!hp.xbP[i].length() || !hp.xbA[i].length()) continue;
+    Btn& b = xbtn[i]; bool r = pinDown(hp.xbP[i]);
+    if (r != b.raw) { b.raw = r; b.chg = now; }
+    if (now - b.chg > 25 && r != b.down) { b.down = r; if (r) b.swallow = touched(now); else { if (!b.swallow) runAction(hp.xbA[i]); b.swallow = false; } }
+  }
   // both held: the third shortcut, once
   if (btn.down && btn2.down && !bothDone && now - max(btn.t0, btn2.t0) >= BOTH_MS) { bothDone = true; btn.held = btn2.held = true; btn.swallow = btn2.swallow = false; inputSrc = 3; shortcut(btnB); inputSrc = 0; }
   encTick(now);
@@ -3249,9 +3842,89 @@ void screenTick() {
   uint8_t base = screenOn ? full : (oledOK ? min(full, LED_DIM) : 0), l1 = base, l2 = base;
   if (alarmActive() || tripBeeping()) l1 = l2 = (now / (bnStage == 1 ? 500 : 150)) % 2 ? full : 0;
   else if (now < ledBlinkUntil) { uint8_t b = (now / 100) % 2 ? full : 0; if (ledBlinkMask & 1) l1 = b; if (ledBlinkMask & 2) l2 = b; }
-  ledcWrite(BTN_LED, l1); ledcWrite(BTN2_LED, l2);
+  if (lightTestMs && now - lightTestMs < 4000) { uint32_t k = (now - lightTestMs) / 1000; l1 = k == 0 ? 255 : 0; l2 = k == 1 ? 255 : 0; } else lightTestMs = 0;
+  pinLevel(hp.backLed, l1); pinLevel(hp.selLed, l2);
   if (!screenOn) return;
   if (redraw || now - lastDrawMs > (alarmActive() ? 250u : mqOn ? 30u : 1000u)) { drawScreen(); lastDrawMs = now; redraw = false; }
+}
+
+// ---- indicator lights: two LEDs on any pins (Settings > Pin mapping), each showing up to three states ----
+// Settings > Indicator lights: per light, a list of [state, pattern]; the first state that is true sets the pattern.
+// Patterns: s solid, b slow blink (1 a second), f fast blink (4 a second), p a blip every 2 s.
+// dim: follow the screen's brightness (and stay faint while it sleeps); slp: off while the screen sleeps.
+const char* IND_K[] = { "job", "jpause", "trip", "gpson", "fix", "nofix", "batt", "chg", "sd", "clk", "ap", "wifi", "nowifi" };
+const uint8_t IND_N = sizeof IND_K / sizeof IND_K[0];
+struct IndRule { uint8_t k; char p; };
+struct IndCfg { IndRule r[3]; uint8_t n = 0; bool dim = true, slp = false; } indC[2];
+String indParse(const String& js, bool apply) {             // "" if fine, else what's wrong
+  IndCfg n[2];
+  if (js.length()) {
+    JsonDocument d; if (deserializeJson(d, js) || !d.is<JsonArray>()) return "Indicator lights: bad settings";
+    int i = 0;
+    for (JsonVariant L : d.as<JsonArray>()) {
+      if (i >= 2) return "Two indicator lights at most";
+      n[i].dim = L["dim"] | true; n[i].slp = L["slp"] | false;
+      for (JsonVariant R : L["r"].as<JsonArray>()) {
+        if (n[i].n >= 3) return "Three states per light at most";
+        String k = R[0] | ""; String p = R[1] | "s"; int ki = -1;
+        for (uint8_t j = 0; j < IND_N; j++) if (k == IND_K[j]) ki = j;
+        if (ki < 0) return "Unknown state " + k;
+        if (p.length() != 1 || !strchr("sbfp", p[0])) return "Unknown pattern " + p;
+        for (uint8_t j = 0; j < n[i].n; j++) if (n[i].r[j].k == ki) return "A state is chosen twice for one light";
+        n[i].r[n[i].n++] = { (uint8_t)ki, p[0] };
+      }
+      i++;
+    }
+  }
+  if (apply) { indC[0] = n[0]; indC[1] = n[1]; }
+  return "";
+}
+bool indState(uint8_t k) {
+  switch (k) {
+    case 0: return jobState().run >= 0;
+    case 1: return jobState().pz >= 0;
+    case 2: return WT.on;
+    case 3: return !gpsAsleep;
+    case 4: return !gpsAsleep && gps.fix;
+    case 5: return !gpsAsleep && !gps.fix;
+    case 6: return battType && !battChg && !isnan(battPct) && battPct < 20;
+    case 7: return battType && battChg;
+    case 8: return !sdOK;
+    case 9: return !timeValid;
+    case 10: return apUp;
+    case 11: return staUp;
+    case 12: return !staUp;
+  }
+  return false;
+}
+void indTick() {
+  if (!hp.ind[0].length() && !hp.ind[1].length()) return;
+  uint32_t now = millis();
+  if (!indAt || now - indAt >= 1000) {                      // the states, once a second (the job one reads the time log)
+    indAt = now ? now : 1; indMask = 0; bool jobDone = false;
+    for (int L = 0; L < 2; L++) for (uint8_t j = 0; j < indC[L].n; j++) {
+      uint8_t k = indC[L].r[j].k; if ((k == 0 || k == 1) && jobDone) continue;
+      if (k == 0 || k == 1) { JobSt js = jobState(); jobDone = true; if (js.run >= 0) indMask |= 1; if (js.pz >= 0) indMask |= 2; }
+      else if (indState(k)) indMask |= 1UL << k;
+    }
+  }
+  for (int L = 0; L < 2; L++) {
+    if (!hp.ind[L].length()) continue;
+    const IndCfg& c = indC[L]; int8_t cur = -1;
+    for (uint8_t j = 0; j < c.n && cur < 0; j++) if (indMask >> c.r[j].k & 1) cur = j;
+    indCur[L] = cur;
+    bool lit = false;
+    if (cur >= 0) switch (c.r[cur].p) {
+      case 's': lit = true; break;
+      case 'b': lit = (now / 500) % 2 == 0; break;
+      case 'f': lit = (now / 125) % 2 == 0; break;
+      case 'p': lit = now % 2000 < 120; break;
+    }
+    uint8_t full = c.dim ? (uint8_t)constrain(cfg.contrast, 1, 255) : 255;
+    uint8_t v = !lit ? 0 : screenOn ? full : c.slp ? 0 : c.dim ? min(full, LED_DIM) : full;
+    if (lightTestMs && now - lightTestMs < 4000) v = (now - lightTestMs) / 1000 == (uint32_t)(2 + L) ? 255 : 0;
+    pinLevel(hp.ind[L], v);
+  }
 }
 
 // ---- web: timers, find-my-box, BNWAS ----
@@ -3313,6 +3986,21 @@ void handleTimersPost() {
       cfg.clHideDone = d["clHide"].as<bool>(); clVer = 0xFFFFFFFF;            // re-read the list
       if (flashOK && !cfgSave()) { sendErr(503, "Could not save"); return; }
     }
+  } else if (op == "dev") {                               // {"op":"dev","clkMan":bool,"gpsDet":0-2,"tripAskMin":10-480,"envMin":1|2|5|10|15}
+    Cfg o = cfg;
+    if (d["clkMan"].is<bool>()) cfg.clkMan = d["clkMan"];
+    if (d["gpsDet"].is<int>()) cfg.gpsDet = constrain(d["gpsDet"].as<int>(), 0, 2);
+    if (d["tripAskMin"].is<int>()) cfg.tripAskMin = constrain(d["tripAskMin"].as<int>(), 10, 480);
+    if (d["envMin"].is<int>()) { if (!envMinOk(d["envMin"].as<int>())) { cfg = o; sendErr(400, "Climate log: 1, 2, 5, 10 or 15 minutes"); return; } cfg.envMin = d["envMin"]; }
+    if (d["ind"].is<JsonArray>()) {                       // [{"r":[[state,pattern],...],"dim":bool,"slp":bool},{...}]
+      String js; serializeJson(d["ind"], js); String e = indParse(js, false);
+      if (e.length()) { cfg = o; sendErr(400, e.c_str()); return; }
+      cfg.ind = js;
+    }
+    if (flashOK && !cfgSave()) { cfg = o; sendErr(503, "Could not save"); return; }
+    if (cfg.envMin != o.envMin) lastEnvSlot = 0;            // the next log waits for the new interval's boundary
+    if (cfg.clkMan != o.clkMan) ntpApply();                 // Manual stops internet time; Automatic starts it on the house Wi-Fi
+    if (cfg.ind != o.ind) { indParse(cfg.ind, true); indAt = 0; }
   } else { sendErr(400, "Unknown op"); return; }
   redraw = true;
   alarmsTick(now);
@@ -3504,18 +4192,22 @@ void handleStatus() {
   kvS(s, "tz", cfg.tz); kvB(s, "setupDone", cfg.setupDone);
   if (findPhoneEp) kvU(s, "findPhone", findPhoneEp);      // a shortcut asked the open dashboards to sound
   kvB(s, "passSet", passSet()); kvB(s, "login", needLogin()); kv(s, "remembered", String(sessKept()));
+  s += ",\"hw\":{\"pr\":" + jStr(AK_NAME[prK]) + ",\"th\":" + jStr(AK_NAME[thK]) + ",\"boxC\":" + jNum(boxThFresh() ? boxC : NAN, 2) + ",\"boxRH\":" + jNum(boxThFresh() ? boxRH : NAN, 1) +
+       ",\"lx\":" + jStr(AK_NAME[lxK]) + ",\"lux\":" + jNum(lxK ? boxLux : NAN, 1) + ",\"imu\":" + jStr(AK_NAME[imK]) + ",\"rot\":" + String(imRotCur) + ",\"ind\":[" + String(hp.ind[0].length() ? indCur[0] : -2) + "," + String(hp.ind[1].length() ? indCur[1] : -2) + "],\"indCfg\":" + (cfg.ind.length() ? cfg.ind : String("[]")) + "}";
   kvB(s, "timeValid", timeValid); kvS(s, "timeSrc", timeSrc); kvB(s, "rtcOK", rtcOK);
+  s += ",\"dev\":{\"clkMan\":" + jBool(cfg.clkMan); kvB(s, "apHomeOff", cfg.apHomeOff); kvB(s, "apForce", apForce); kvS(s, "mdns", cfg.mdns);
+  kvU(s, "gpsDet", cfg.gpsDet); kvU(s, "tripAskMin", cfg.tripAskMin); kvU(s, "envMin", cfg.envMin); s += "}";
   kvS(s, "store", storeName); kvB(s, "storeOK", store != nullptr); kvB(s, "flashOK", flashOK);
   kvU(s, "flashKB", flashOK ? LittleFS.usedBytes() / 1024 : 0); kvU(s, "flashTotalKB", flashOK ? LittleFS.totalBytes() / 1024 : 0);
   kvB(s, "sdOK", sdOK); kvU(s, "cardMB", sdOK ? (uint32_t)(SD.cardSize() / (1024ULL * 1024ULL)) : 0);
   kvB(s, "eeOK", eeOK); kvS(s, "lastAlive", lastAlive > 1735689600UL ? isoLocal(lastAlive) : String(""));
   kvS(s, "resetReason", resetName(resetReason));
-  kvU(s, "logSeq", logNextSeq - 1); kvU(s, "logBytes", logBytes); kvU(s, "logBad", logBadLines); kvU(s, "envLogS", ENV_LOG_S); kvU(s, "envFlashDays", ENV_FLASH_DAYS);
+  kvU(s, "logSeq", logNextSeq - 1); kvU(s, "logBytes", logBytes); kvU(s, "logBad", logBadLines); kvU(s, "envLogS", envLogS()); kvU(s, "envFlashDays", ENV_FLASH_DAYS);
   kvS(s, "uiSrc", uiSource()); kvU(s, "docVer", docVer);
   bool up = WiFi.status() == WL_CONNECTED;
   s += ",\"sta\":{\"ssid\":" + jStr(cfg.homeSsid); kvB(s, "up", up); kvS(s, "ip", WiFi.localIP().toString()); kv(s, "rssi", String(up ? WiFi.RSSI() : 0)); s += "}";
   s += ",\"ap\":{\"up\":" + jBool(apUp); kvS(s, "ssid", cfg.apSsid); kvS(s, "ip", WiFi.softAPIP().toString()); kvU(s, "clients", WiFi.softAPgetStationNum()); s += "}";
-  kvU(s, "channel", WiFi.channel()); kvS(s, "mdns", String(MDNS_NAME) + ".local");
+  kvU(s, "channel", WiFi.channel()); kvS(s, "mdns", cfg.mdns + ".local");
   uint8_t m[6]; WiFi.macAddress(m); kvS(s, "hubMac", macStr(m));
   kvU(s, "uptime", millis() / 1000); kvU(s, "heap", ESP.getFreeHeap());
   s += ",\"batt\":{\"ok\":" + jBool(battType != 0); kv(s, "pct", jNum(battPct, 0)); kv(s, "v", jNum(battV, 2)); kv(s, "rate", jNum(battRate, 2)); kv(s, "left", jNum(battLeftH, 1)); kvB(s, "chg", battChg); kvB(s, "usbSense", USB_PIN >= 0); kvB(s, "measuring", !battChg && !battSpanOk); kv(s, "offV", jNum(BATT_OFF_V, 2)); s += "}";
@@ -3660,18 +4352,35 @@ void handleDownload() {
   f.close();
 }
 
+// ?epoch=<UTC seconds> sets it from the dashboard's device; ?local=YYYY-MM-DDTHH:MM[:SS] is a time typed in, in the
+// box's own time zone. In Automatic, GPS and internet time win (force=1 sets it anyway; they correct it again later).
+bool setClockTo(time_t e, const char* src) {
+  if ((uint32_t)e < 1735689600UL) return false;          // before 2025: not a real time
+  setSystemUtc(e); writeRtc(e);
+  timeValid = true; timeSrc = src; lastEnvSlot = 0;
+  return true;
+}
+time_t localToEpoch(int y, int mo, int d, int h, int mi, int se) {   // a wall-clock time in the box's time zone
+  struct tm tm = {}; tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d; tm.tm_hour = h; tm.tm_min = mi; tm.tm_sec = se; tm.tm_isdst = -1;
+  return mktime(&tm);
+}
 void handleTime() {
-  uint32_t e = (uint32_t)server.arg("epoch").toInt();
-  if (e < 1735689600UL) { sendErr(400, "epoch looks wrong"); return; }   // before 2025-01-01
-  if (timeValid && (!strcmp(timeSrc, "gps") || !strcmp(timeSrc, "ntp")) && server.arg("force") != "1") {
+  String L = server.arg("local");
+  bool typed = L.length() > 0, force = server.arg("force") == "1" || typed;
+  time_t e;
+  if (typed) {
+    if (L.length() < 16 || L[4] != '-' || L[7] != '-' || L[10] != 'T' || L[13] != ':') { sendErr(400, "local=YYYY-MM-DDTHH:MM"); return; }
+    int y = L.substring(0, 4).toInt(), mo = L.substring(5, 7).toInt(), d = L.substring(8, 10).toInt(), h = L.substring(11, 13).toInt(), mi = L.substring(14, 16).toInt();
+    int se = L.length() >= 19 ? L.substring(17, 19).toInt() : 0;
+    if (y < 2025 || y > 2099 || mo < 1 || mo > 12 || d < 1 || d > 31 || h > 23 || mi > 59 || se > 59) { sendErr(400, "That date or time doesn't exist"); return; }
+    e = localToEpoch(y, mo, d, h, mi, se);
+  } else e = (time_t)(uint32_t)server.arg("epoch").toInt();
+  if ((uint32_t)e < 1735689600UL) { sendErr(400, "epoch looks wrong"); return; }   // before 2025-01-01
+  if (!cfg.clkMan && !force && timeValid && (!strcmp(timeSrc, "gps") || !strcmp(timeSrc, "ntp"))) {
     server.send(200, "application/json", "{\"ok\":false,\"kept\":" + jStr(timeSrc) + "}"); return;
   }
-  setSystemUtc((time_t)e);
-  writeRtc((time_t)e);
-  timeValid = true;
-  timeSrc = "laptop";
-  lastEnvSlot = 0;
-  server.send(200, "application/json", "{\"ok\":true,\"local\":" + jStr(isoLocal((time_t)e)) + "}");
+  setClockTo(e, typed ? "manual" : "laptop");
+  server.send(200, "application/json", "{\"ok\":true,\"local\":" + jStr(isoLocal(e)) + ",\"auto\":" + jBool(!cfg.clkMan) + "}");
 }
 
 
@@ -3769,6 +4478,7 @@ void handleDocGet() {
   f.close();
 }
 
+const size_t DOC_MAX = 98304;   // 96 kB a document: room for a checklist of about 500-800 items (big bodies go to PSRAM)
 bool writeDoc(fs::FS& fs, const String& p, const String& body) {
   String tmp = p + ".tmp";
   File f = fs.open(tmp, FILE_WRITE);
@@ -3784,7 +4494,7 @@ void handleDocPut() {
   String n = server.arg("n");
   if (!validDocName(n)) { sendErr(400, "Bad document name"); return; }
   String body = server.arg("plain");
-  if (body.length() < 2 || body.length() > 32768 || body[0] != '{') { sendErr(400, "Body must be a JSON object under 32 kB"); return; }
+  if (body.length() < 2 || body.length() > DOC_MAX || body[0] != '{') { sendErr(400, "Body must be a JSON object under 96 kB"); return; }
   if (validIcsName(n)) { sendErr(400, "Calendars go to /api/doc-up"); return; }
   String p = docPath(n);
   bool ok = false;
@@ -4008,7 +4718,8 @@ void handleRestoreDone() {
 void handleConfigGet() {
   server.sendHeader("Cache-Control", "no-store");
   server.send(200, "application/json", "{\"apSsid\":" + jStr(cfg.apSsid) + ",\"homeSsid\":" + jStr(cfg.homeSsid) + ",\"homeSet\":" + jBool(cfg.homePass.length() > 0) +
-              ",\"tz\":" + jStr(cfg.tz) + ",\"setupDone\":" + jBool(cfg.setupDone) + ",\"passSet\":" + jBool(passSet()) + ",\"apDefault\":" + jBool(cfg.apPass == HUB_AP_PASS) + "}");
+              ",\"tz\":" + jStr(cfg.tz) + ",\"setupDone\":" + jBool(cfg.setupDone) + ",\"passSet\":" + jBool(passSet()) + ",\"apDefault\":" + jBool(cfg.apPass == HUB_AP_PASS) +
+              ",\"apHomeOff\":" + jBool(cfg.apHomeOff) + ",\"mdns\":" + jStr(cfg.mdns) + "}");
 }
 // Body: JSON with any of apSsid, apPass, homeSsid, homePass, tz, setupDone, newPass. Passwords left out stay as
 // they are. Until a box password exists none is needed; after that ?pw= must be the box password.
@@ -4024,6 +4735,8 @@ void handleConfigPost() {
   if (d["homePass"].is<const char*>()) n.homePass = (const char*)d["homePass"];
   if (d["tz"].is<const char*>() && strlen(d["tz"])) n.tz = (const char*)d["tz"];
   if (d["setupDone"].is<bool>()) n.setupDone = d["setupDone"];
+  if (d["apHomeOff"].is<bool>()) n.apHomeOff = d["apHomeOff"];
+  if (d["mdns"].is<const char*>()) { n.mdns = (const char*)d["mdns"]; n.mdns.trim(); n.mdns.toLowerCase(); if (n.mdns.endsWith(".local")) n.mdns.remove(n.mdns.length() - 6); }
   String np = d["newPass"] | "";
   if (np.length() && (np.length() < 8 || np.length() > 64)) { sendErr(400, "Box password: 8 to 64 characters"); return; }
   if (n.setupDone && !passSet() && !np.length()) { sendErr(400, "Choose a box password"); return; }
@@ -4032,12 +4745,14 @@ void handleConfigPost() {
   if (!n.apSsid.length() || n.apSsid.length() > 32) { sendErr(400, "Hotspot name: 1 to 32 characters"); return; }
   if (n.apPass.length() < 8 || n.apPass.length() > 63) { sendErr(400, "Hotspot password: 8 to 63 characters"); return; }
   if (n.homeSsid.length() > 32 || n.homePass.length() > 63) { sendErr(400, "Home Wi-Fi name or password too long"); return; }
-  bool ap = n.apSsid != cfg.apSsid || n.apPass != cfg.apPass, sta = n.homeSsid != cfg.homeSsid || n.homePass != cfg.homePass;
+  if (!mdnsOk(n.mdns)) { sendErr(400, "Network name: 1 to 32 of a-z, 0-9 and -, not starting or ending with -"); return; }
+  bool mdnsChg = n.mdns != cfg.mdns;
+  bool ap = n.apSsid != cfg.apSsid || n.apPass != cfg.apPass || n.apHomeOff != cfg.apHomeOff, sta = n.homeSsid != cfg.homeSsid || n.homePass != cfg.homePass;
   Cfg old = cfg; cfg = n;
   if (np.length()) passSetTo(np);
   if (!cfgSave()) { cfg = old; sendErr(503, "Could not save"); return; }
   if (np.length()) { sess.clear(); sessSave(); if (!viaHotspot()) setCookie(sessNew(false), false); }   // a new password signs every device out
-  cfgApplyAp = ap; cfgApplySta = sta; cfgApplyAt = millis() + 1500;   // after this reply has gone out
+  cfgApplyAp = ap; cfgApplySta = sta; cfgApplyMdns = mdnsChg; cfgApplyAt = millis() + 1500;   // after this reply has gone out
   server.send(200, "application/json", String("{\"ok\":true,\"apChanged\":") + jBool(ap) + ",\"homeChanged\":" + jBool(sta) + "}");
 }
 void handleScan() {
@@ -4102,6 +4817,47 @@ bool serveAttachment(const String& uri) {
   return true;
 }
 
+// Settings > Pin mapping ({"pins":{back,sel,backLed,selLed,buzA,buzB,xb:[[pin,action]x4]}}) and Add-ons
+// ({"add":{off,bh,pcf,imuM,imuF,imuW,imuR}}): checked, saved, and the box restarts to use them
+void handleHwPost() {
+  JsonDocument d; if (deserializeJson(d, server.arg("plain"))) { sendErr(400, "Bad JSON"); return; }
+  if (d["pins"].is<JsonObject>()) {
+    JsonObject P = d["pins"];
+    HwPins n = hp;
+    const char* K[] = { "back", "sel", "backLed", "selLed", "buzA", "buzB" }; String* R[] = { &n.back, &n.sel, &n.backLed, &n.selLed, &n.buzA, &n.buzB };
+    for (int i = 0; i < 6; i++) if (P[K[i]].is<const char*>()) *R[i] = (const char*)P[K[i]];
+    if (P["xb"].is<JsonArray>()) { int i = 0; for (JsonVariant v : P["xb"].as<JsonArray>()) { if (i >= 4) break; n.xbP[i] = v[0] | ""; n.xbA[i] = v[1] | ""; i++; } }
+    if (P["ind"].is<JsonArray>()) { int i = 0; for (JsonVariant v : P["ind"].as<JsonArray>()) { if (i >= 2) break; n.ind[i++] = v | ""; } }
+    std::vector<String> all = { n.back, n.sel, n.backLed, n.selLed, n.buzA, n.buzB };
+    for (int i = 0; i < 4; i++) all.push_back(n.xbP[i]);
+    all.push_back(n.ind[0]); all.push_back(n.ind[1]);
+    for (size_t i = 0; i < all.size(); i++) {
+      if (!pinValid(all[i], i == 4 || i == 5)) { sendErr(400, (String(i == 4 || i == 5 ? "The buzzer needs Feather pins: " : "Not a pin this box has free: ") + all[i]).c_str()); return; }
+      for (size_t j = 0; j < i; j++) if (all[i].length() && all[i] == all[j]) { sendErr(400, ("Pin " + all[i] + " is used twice").c_str()); return; }
+    }
+    if (!n.back.length() || !n.sel.length()) { sendErr(400, "BACK and SELECT need a pin each"); return; }
+    for (int i = 0; i < 4; i++) {
+      bool ok = !n.xbA[i].length(); for (const char* a : XB_ACT) if (n.xbA[i] == a) ok = true;
+      if (!ok) { sendErr(400, ("Unknown action " + n.xbA[i]).c_str()); return; }
+    }
+    HwPins keep = hp; hp = n; String js = hwPinsJson(); hp = keep;
+    cfg.hwPins = js;
+  }
+  if (d["add"].is<JsonObject>()) {
+    JsonObject A = d["add"];
+    String off = A["off"] | addOff; int bh = A["bh"] | (int)bhAddr, pcf = A["pcf"] | (int)pcfAddr;
+    if (bh && bh != 0x23 && bh != 0x5C) { sendErr(400, "The BH1750 is at 0x23 or 0x5C"); return; }
+    if (pcf && (pcf < 0x20 || pcf > 0x27)) { sendErr(400, "A PCF8574 is at 0x20 to 0x27"); return; }
+    if (bh && bh == pcf) { sendErr(400, "The light sensor and the PCF8574 can't share an address"); return; }
+    String js = "{\"off\":" + jStr(off) + ",\"bh\":" + String(bh) + ",\"pcf\":" + String(pcf) + ",\"imuM\":" + String(constrain((int)(A["imuM"] | (int)imuMount), 0, 3)) +
+                ",\"imuF\":" + jBool(A["imuF"] | imuFlip) + ",\"imuW\":" + jBool(A["imuW"] | imuWake) + ",\"imuR\":" + jBool(A["imuR"] | imuRot) + "}";
+    cfg.hwAdd = js;
+  }
+  if (flashOK && !cfgSave()) { sendErr(503, "Could not save"); return; }
+  server.send(200, "application/json", "{\"ok\":true,\"restart\":true}");
+  delay(400); ESP.restart();
+}
+
 void setupWeb() {
   // no CORS: the dashboard comes from the box itself, so other web pages open on a phone can't read the box
   server.on("/", HTTP_GET, handleRoot);
@@ -4126,6 +4882,7 @@ void setupWeb() {
       } else LittleFS.remove("/www/index.tmp");
       server.sendHeader("Connection", "close");
       String msg = ok ? "Update OK - restarting" : (!otaAuthorized ? "Wrong password" : otaErr.length() ? otaErr : String("Update failed: ") + Update.errorString());
+      if (otaAuthorized) { if (ok) { otaSt = 2; otaDraw(true); } else { if (!otaErr.length()) otaErr = msg; otaFailed(); } }   // nothing on the box for a wrong password
       server.send(ok ? 200 : (otaAuthorized ? 500 : 403), "text/plain", msg);
       if (ok) { delay(500); ESP.restart(); }
     },
@@ -4134,8 +4891,10 @@ void setupWeb() {
       if (up.status == UPLOAD_FILE_START) {
         otaAuthorized = pwCheck(server.arg("pw"));
         upKind = 0; upHead = ""; otaErr = ""; upUiLeft = 0; upBinSize = 0;
+        if (otaAuthorized) { otaSt = 1; otaDone = 0; otaTot = max(0, server.clientContentLength()); otaNew = ""; qmOn = csOn = false; otaDraw(true); }
       } else if (up.status == UPLOAD_FILE_WRITE) {
         if (!otaAuthorized || upKind == 9) return;
+        otaDone += up.currentSize; otaDraw(false);
         const uint8_t* d = up.buf; size_t n = up.currentSize;
         while (n) {
           if (upKind == 0) {
@@ -4150,6 +4909,7 @@ void setupWeb() {
             int u = upHead.indexOf("\"ui\":"), bi = upHead.indexOf("\"bin\":");
             if (u < 0 || bi < 0 || !flashOK) { upKind = 9; otaErr = flashOK ? "Bad update file header" : "Flash not mounted"; return; }
             upUiLeft = upHead.substring(u + 5).toInt(); upBinSize = upHead.substring(bi + 6).toInt();
+            { int v = upHead.indexOf("\"fw\":\""); if (v >= 0) { int e = upHead.indexOf('"', v + 6); if (e > v + 6 && e - v < 20) otaNew = upHead.substring(v + 6, e); } }   // the new version, for old --> new
             if (!LittleFS.exists("/www")) LittleFS.mkdir("/www");
             LittleFS.remove("/www/index.tmp");
             if (flashFree() < upUiLeft + 64 * 1024) { LittleFS.remove("/www/index.html.gz"); LittleFS.remove("/www/index.html"); }   // short of room: the old dashboard goes first (the box shows its update page until the new one is in)
@@ -4171,6 +4931,7 @@ void setupWeb() {
         if (upUi) upUi.close();
       } else if (up.status == UPLOAD_FILE_ABORTED) {
         Update.abort(); if (upUi) upUi.close(); LittleFS.remove("/www/index.tmp");
+        if (otaAuthorized) { otaErr = "The upload was cut off"; otaFailed(); }
       }
     });
   // dashboard .html upload -> flash
@@ -4227,6 +4988,10 @@ void setupWeb() {
   server.on("/api/gpsdays", HTTP_GET, G(handleGpsDays));
   server.on("/api/gps", HTTP_GET, G(handleGps));
   server.on("/api/gps-add", HTTP_POST, G(handleGpsAdd));
+  server.on("/api/hw", HTTP_GET, G([]() { server.sendHeader("Cache-Control", "no-store"); server.send(200, "application/json", hwJson()); }));
+  server.on("/api/hw", HTTP_POST, G(handleHwPost));
+  server.on("/api/hw-scan", HTTP_POST, G([]() { addScan(true); server.send(200, "application/json", hwJson()); }));
+  server.on("/api/hw-test", HTTP_POST, G([]() { lightTestMs = millis(); server.send(200, "application/json", "{\"ok\":true}"); }));
   server.on("/api/gps-del", HTTP_POST, G(handleGpsDel));
   server.on("/api/gmaps-list", HTTP_GET, G(handleGmapsList));
   server.on("/api/restore", HTTP_POST, handleRestoreDone, handleRestoreUpload);
@@ -4276,7 +5041,7 @@ void lowBattOff() {
   Serial.printf("Battery %.2f V: switching off\n", battV);
   heartbeatNow(true);                                      // the off time is measured from now, and History will say why
   lowShow("BATTERY LOW", "Switched off.", "Charge it, then", "slide power off & on", 6000);
-  ledcWrite(BTN_LED, 0); ledcWrite(BTN2_LED, 0); buzSet(0); hapSet(false);
+  pinLevel(hp.backLed, 0); pinLevel(hp.selLed, 0); buzSet(0); hapSet(false);
   WiFi.mode(WIFI_OFF);
   if (sdOK) SD.end();                                      // every write is already closed; this just lets go of the card
   if (flashOK) LittleFS.end();
@@ -4306,6 +5071,10 @@ void setup() {
     }
     rtc.start();
   }
+  flashOK = startFlash();
+  if (flashOK) cfgLoad(); else cfgDefaults();
+  hwPinsLoad(cfg.hwPins); hwAddLoad(cfg.hwAdd); indParse(cfg.ind, true);
+  hwStart();                                               // the scan; expanders and sensors from Settings > Add-ons
   baroStart();
   hapStart();
   if (USB_PIN >= 0) { pinMode(USB_PIN, INPUT); analogSetPinAttenuation(USB_PIN, ADC_11db); }
@@ -4315,8 +5084,7 @@ void setup() {
   gpsStart();
   screenStart();
 
-  flashOK = startFlash();
-  if (flashOK) { cfgLoad(); sessLoad(); fixLoad(); } else cfgDefaults();
+  if (flashOK) { sessLoad(); fixLoad(); }
   tripResume();
   setenv("TZ", cfg.tz.c_str(), 1); tzset();
   sdOK = startSD();
@@ -4337,7 +5105,7 @@ void setup() {
   setupWeb();
   Serial.printf("House Wi-Fi %s  %s   hotspot %s  %s   ch %d   http://%s.local\n",
                 staUp ? "up" : "down", WiFi.localIP().toString().c_str(), apUp ? "up" : "off",
-                WiFi.softAPIP().toString().c_str(), (int)WiFi.channel(), MDNS_NAME);
+                WiFi.softAPIP().toString().c_str(), (int)WiFi.channel(), cfg.mdns.c_str());
   Serial.printf("MAC for the node sketches (HUB_MAC): %s\n", WiFi.macAddress().c_str());
 }
 
@@ -4347,15 +5115,18 @@ void loop() {
 
   if (ntpSynced) {
     ntpSynced = false;
-    writeRtc(time(nullptr));
-    timeValid = true;
-    timeSrc = "ntp";
-    lastNtpSync = millis();
+    if (!cfg.clkMan) {                    // (Manual stops internet time; a sync already under way is ignored)
+      writeRtc(time(nullptr));
+      timeValid = true;
+      timeSrc = "ntp";
+      lastNtpSync = millis();
+    }
   }
   gpsTick();
   gpsPowerTick();
   battTick();
   screenTick();
+  indTick();
 
   outageCheck();
   heartbeatTick();
